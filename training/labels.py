@@ -21,11 +21,14 @@ def score_to_cp(cp: float | None, mate: int | None) -> float:
     return float(cp if cp is not None else 0.0)
 
 
-def cp_to_wdl(cp: float, scale: float = 350.0, draw_margin: float = 90.0) -> Wdl:
+def cp_to_wdl(cp: float, scale: float = 230.0, draw_margin: float = 60.0) -> Wdl:
     """Soft win/draw/loss from a side-to-move centipawn score.
 
     Two logistic shoulders ``draw_margin`` apart: outside the margin the score
-    tends to a decisive result, inside it the mass sits on the draw.
+    tends to a decisive result, inside it the mass sits on the draw. The scale
+    is tuned so +200cp maps to ~65% and +400cp to ~81%, matching empirical
+    Lichess win rates - the earlier default was far too soft (58% at +200),
+    which taught the value head to under-rate real advantages.
     """
     cp = max(-MATE_CP, min(MATE_CP, cp))
     win = 1.0 / (1.0 + math.exp(-(cp - draw_margin) / scale))

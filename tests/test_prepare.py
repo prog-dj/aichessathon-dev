@@ -31,14 +31,15 @@ def test_iter_eval_samples_picks_deepest_and_flips_pov() -> None:
     samples = list(iter_eval_samples([json.dumps(row) for row in _EVAL_ROWS]))
     assert len(samples) == 2
 
-    record, policy_index, (win, _draw, loss) = samples[0]
+    record, policy_index, (win, _draw, loss), cp = samples[0]
     board = chess.Board(_EVAL_ROWS[0]["fen"] + " 0 1")
     assert index_to_move(board, policy_index) == chess.Move.from_uci("e2e4")  # deepest pv
     assert win > loss  # +30 cp for the side to move
+    assert cp == 30.0
     assert unpack_position(record).shape == (19, 8, 8)
 
-    _, _, (win2, _, loss2) = samples[1]
-    assert loss2 > win2  # +900 for White, but Black is to move
+    _, _, (win2, _, loss2), cp2 = samples[1]
+    assert loss2 > win2 and cp2 == -900.0  # +900 for White, but Black is to move
 
 
 def test_iter_eval_samples_skips_shallow_and_illegal() -> None:
@@ -73,10 +74,11 @@ def test_iter_pgn_samples_filters_by_elo_and_skips_opening() -> None:
     samples = list(iter_pgn_samples(io.StringIO(_PGN), min_elo=2200, skip_plies=4))
     # only the first game qualifies; it has 10 plies, sampled from ply 4 -> 6 samples
     assert len(samples) == 6
-    for record, policy_index, wdl in samples:
+    for record, policy_index, wdl, cp in samples:
         assert unpack_position(record).shape == (19, 8, 8)
         assert 0 <= policy_index < 64 * 73
         assert wdl in {(1.0, 0.0, 0.0), (0.0, 0.0, 1.0)}  # decisive game, never a draw target
+        assert cp != cp  # NaN: game-result samples carry no centipawn score
 
 
 def test_iter_pgn_samples_result_pov_alternates() -> None:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import urllib.request
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -35,7 +36,7 @@ from encoding import move_to_index
 from training.labels import Wdl, cp_to_wdl, result_to_wdl, score_to_cp
 from training.pack import pack_position
 
-Sample = tuple["object", int, Wdl]  # (uint8 record, policy index, wdl)
+Sample = tuple["object", int, Wdl, float]  # (uint8 record, policy index, wdl, centipawns or NaN)
 
 
 def _board_from_eval_fen(fen: str) -> chess.Board:
@@ -70,7 +71,7 @@ def iter_eval_samples(lines: Iterable[str], min_depth: int = 12) -> Iterator[Sam
         # Lichess eval scores are from White's point of view; flip to side to move.
         cp_white = score_to_cp(pvs[0].get("cp"), pvs[0].get("mate"))
         cp_stm = cp_white if board.turn == chess.WHITE else -cp_white
-        yield pack_position(board), move_to_index(board, move), cp_to_wdl(cp_stm)
+        yield pack_position(board), move_to_index(board, move), cp_to_wdl(cp_stm), cp_stm
 
 
 def iter_pgn_samples(
@@ -95,7 +96,7 @@ def iter_pgn_samples(
         for ply, move in enumerate(game.mainline_moves()):
             if ply >= skip_plies and (ply - skip_plies) % stride == 0:
                 wdl = result_to_wdl(result, board.turn == chess.WHITE)
-                yield pack_position(board), move_to_index(board, move), wdl
+                yield pack_position(board), move_to_index(board, move), wdl, math.nan
             board.push(move)
 
 
@@ -119,8 +120,8 @@ def _run(samples: Iterator[Sample], out: Path, limit: int) -> None:
     from training.data import ShardWriter
 
     writer = ShardWriter(out)
-    for record, policy_index, wdl in samples:
-        writer.add(record, policy_index, wdl)  # type: ignore[arg-type]
+    for record, policy_index, wdl, cp in samples:
+        writer.add(record, policy_index, wdl, cp)  # type: ignore[arg-type]
         if writer.total % 100_000 == 0:
             print(f"{writer.total:,} samples")
         if writer.total >= limit:
