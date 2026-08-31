@@ -29,12 +29,13 @@ from inference import Evaluator
 
 @dataclass(frozen=True)
 class PuctConfig:
-    c_puct: float = 1.6
+    c_puct: float = 1.25
     batch_size: int = 8
-    fpu_reduction: float = 0.15  # value penalty for an unvisited child
+    fpu_reduction: float = 0.5  # value penalty for an unvisited child
     virtual_loss: float = 1.0
+    max_children: int = 12  # widen only to the top policy moves (+ forced tactics)
     tactical_floor: float = 0.02  # minimum prior handed to a forced capture/check
-    contempt: float = 0.08  # draws count this much against the side to move at the root
+    contempt: float = 0.0  # draws count this much against the side to move at the root
     max_sims: int = 1_000_000
 
 
@@ -124,15 +125,14 @@ class PuctSearch:
     def _expand(self, node: Node, board: chess.Board, priors: dict[chess.Move, float]) -> None:
         if node.children:
             return
-        forced = {
-            move
-            for move in board.legal_moves
-            if board.is_capture(move) or board.gives_check(move)
-        }
+        legal = list(board.legal_moves)
+        forced = {m for m in legal if board.is_capture(m) or board.gives_check(m)}
+        # widen only to the strongest policy moves, but never drop a forced tactic
+        top = sorted(legal, key=lambda m: priors.get(m, 0.0), reverse=True)
+        keep = set(top[: self.config.max_children]) | forced
         floor = self.config.tactical_floor
         weights = {
-            move: max(priors.get(move, 0.0), floor if move in forced else 0.0)
-            for move in board.legal_moves
+            move: max(priors.get(move, 0.0), floor if move in forced else 0.0) for move in keep
         }
         total = sum(weights.values()) or 1.0
         node.children = {move: Node(weight / total) for move, weight in weights.items()}
