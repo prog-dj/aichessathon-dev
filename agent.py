@@ -1,66 +1,83 @@
 """The submission entrypoint. The platform imports this file and calls get_move.
 
-This version has no tree search yet: it scores every legal move by the value the
-network gives the resulting position (a one-ply look-ahead) and uses the policy
-prior only to break near-ties. It exists to exercise the encoding -> ONNX -> move
-path end to end and to measure the raw net against the baselines. PUCT search
-lands on top of the same Evaluator next.
+A PUCT search (search.py) guided by the network (inference.py). This file owns
+the two things the search needs from outside the position: a running board that
+carries the game's move history (so repetitions and the fifty-move rule are
+visible in the tree), and a time budget for the current move.
 """
 
 from __future__ import annotations
 
 import random
+import time
 from pathlib import Path
 
 import chess
 
 from inference import Evaluator
+from search import PuctSearch
 
 _MODEL_PATH = Path(__file__).with_name("weights") / "model.onnx"
-_PRIOR_WEIGHT = 0.15
+_SAFETY_MS = 500  # never plan to use the last half second of the clock
+_PANIC_MS = 4_000
 
-# Loaded once per game, inside the 60 s import budget, before the clock starts.
 try:
-    _evaluator: Evaluator | None = Evaluator(_MODEL_PATH)
+    _search: PuctSearch | None = PuctSearch(Evaluator(_MODEL_PATH))
 except Exception as error:  # missing or broken weights: still play legal moves
-    print(f"evaluator unavailable, falling back to random: {error}")
-    _evaluator = None
+    print(f"evaluator unavailable, playing random: {error}")
+    _search = None
+
+_board = chess.Board()  # our view of the game, kept in sync across calls
 
 
-def _best_move(board: chess.Board, legal: list[chess.Move]) -> chess.Move:
-    evaluator = _evaluator
-    if evaluator is None:
-        return random.choice(legal)
+def _sync(fen: str) -> chess.Board:
+    """Return our running board advanced to ``fen``, keeping history when we can."""
+    global _board
+    target = chess.Board(fen)
+    if _matches(_board, target):
+        return _board
+    for move in _board.legal_moves:  # the opponent's reply gets us there
+        _board.push(move)
+        if _matches(_board, target):
+            return _board
+        _board.pop()
+    _board = target  # desynced (first move, or a skipped position): history is lost
+    return _board
 
-    priors, _ = evaluator.evaluate([board])[0]
 
-    children: list[chess.Board] = []
-    for move in legal:
-        board.push(move)
-        children.append(board.copy(stack=False))
-        board.pop()
-    child_values = [value for _, value in evaluator.evaluate(children)]
+def _matches(a: chess.Board, b: chess.Board) -> bool:
+    return (
+        a.board_fen() == b.board_fen()
+        and a.turn == b.turn
+        and a.castling_rights == b.castling_rights
+        and a.ep_square == b.ep_square
+    )
 
-    # child_value is from the opponent's point of view, so our score is its negation.
-    best = legal[0]
-    best_score = -1e9
-    for move, child_value in zip(legal, child_values, strict=True):
-        score = -child_value + _PRIOR_WEIGHT * priors.get(move, 0.0)
-        if score > best_score:
-            best_score = score
-            best = move
-    return best
+
+def _budget_ms(time_left_ms: int, fullmove: int) -> float:
+    if time_left_ms < _PANIC_MS:
+        return max(20.0, min(time_left_ms * 0.08, 400.0))
+    moves_left = max(14, 44 - fullmove)
+    target = time_left_ms / moves_left + 300.0  # spend the clock plus most of the increment
+    return min(target, time_left_ms - _SAFETY_MS)
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
-    board = chess.Board(fen)
+    board = _sync(fen)
     legal = list(board.legal_moves)
     if not legal:
         return "0000"
-    if len(legal) == 1:
-        return legal[0].uci()
+    if len(legal) == 1 or _search is None:
+        move = legal[0] if len(legal) == 1 else random.choice(legal)
+        board.push(move)
+        return move.uci()
+
     try:
-        return _best_move(board, legal).uci()
-    except Exception as error:  # never forfeit on a bug; play a legal move
-        print(f"get_move fell back to random: {error}")
-        return random.choice(legal).uci()
+        deadline = time.monotonic() + _budget_ms(time_left_ms, board.fullmove_number) / 1000.0
+        move = _search.run(board, deadline)
+    except Exception as error:  # never forfeit on a bug
+        print(f"search failed, playing a legal move: {error}")
+        move = legal[0]
+
+    board.push(move)
+    return move.uci()
