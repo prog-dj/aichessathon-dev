@@ -1,0 +1,10 @@
+# Training-only. Install on the GPU box (Kaggle / cloud), never shipped in the zip.
+#   pip install -r training/requirements.txt
+torch>=2.4
+onnx>=1.17
+onnxscript>=0.7
+onnxruntime>=1.19
+numpy>=2.1
+chess==1.11.2
+zstandard>=0.22
+tqdm>=4.66
