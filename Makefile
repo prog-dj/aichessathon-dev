@@ -15,7 +15,8 @@ test:
 	uv run pytest
 
 zip:
-	uv run python -m harness.package --include encoding.py
+	uv run python -m harness.package --include encoding.py --include inference.py
+	uv run python -m tools.checkzip
 
 gate:
 	uv run ruff check .
