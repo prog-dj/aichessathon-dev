@@ -66,6 +66,9 @@ def main() -> None:
     parser.add_argument("--val-frac", type=float, default=0.01)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out", type=Path, default=Path("weights"))
+    parser.add_argument(
+        "--init-from", type=Path, help="warm-start weights from a .pt (LR schedule restarts)"
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,6 +87,10 @@ def main() -> None:
     val_loader = DataLoader(val_set, shuffle=False, **common)
 
     model = ChessNet(CONFIGS[args.config]).to(device)
+    if args.init_from:
+        blob = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(blob["state_dict"])
+        print(f"warm-started from {args.init_from}")
     print(f"{args.config}: {parameter_count(model) / 1e6:.2f}M params, {len(dataset):,} samples")
     optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -119,9 +126,15 @@ def main() -> None:
 
         policy_acc, value_acc = _evaluate(model, val_loader, device)
         print(f"epoch {epoch}: val policy top1 {policy_acc:.3f}  value acc {value_acc:.3f}")
-        torch.save({"config": args.config, "state_dict": model.state_dict()}, args.out / "model.pt")
-        export_onnx(model, args.out / "model.onnx")
-        print(f"saved {args.out / 'model.pt'} and model.onnx")
+        torch.save(
+            {"config": args.config, "state_dict": model.state_dict()},
+            args.out / f"model.e{epoch}.pt",
+        )
+        try:
+            export_onnx(model, args.out / "model.onnx")
+            print(f"saved model.e{epoch}.pt and model.onnx")
+        except Exception as error:  # a bad export must not kill the run
+            print(f"epoch {epoch}: ONNX export failed ({error}); checkpoint is still saved")
 
 
 if __name__ == "__main__":

@@ -21,21 +21,25 @@ OPSET = 18
 def export_onnx(model: ChessNet, path: Path | str, quantize: bool = False) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    model.eval()
-    dummy = torch.zeros(2, N_PLANES, 8, 8)
-    batch = torch.export.Dim("batch")
-    torch.onnx.export(
-        model,
-        dummy,
-        str(path),
-        input_names=["planes"],
-        output_names=["policy", "value"],
-        dynamic_shapes={"x": {0: batch}},
-        opset_version=OPSET,
-        dynamo=True,
-        external_data=False,
-    )
-    _verify(model, path)
+    origin = next(model.parameters()).device
+    model.eval().to("cpu")  # the exporter traces on CPU; a CUDA model trips it up
+    try:
+        dummy = torch.zeros(2, N_PLANES, 8, 8)
+        batch = torch.export.Dim("batch")
+        torch.onnx.export(
+            model,
+            dummy,
+            str(path),
+            input_names=["planes"],
+            output_names=["policy", "value"],
+            dynamic_shapes={"x": {0: batch}},
+            opset_version=OPSET,
+            dynamo=True,
+            external_data=False,
+        )
+        _verify(model, path)
+    finally:
+        model.to(origin)
     if quantize:
         from onnxruntime.quantization import QuantType, quantize_dynamic
 
