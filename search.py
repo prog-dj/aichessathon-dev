@@ -31,10 +31,11 @@ from inference import Evaluator
 class PuctConfig:
     c_puct: float = 1.6
     batch_size: int = 8
-    fpu_reduction: float = 0.3  # value penalty for an unvisited child
+    fpu_reduction: float = 0.15  # value penalty for an unvisited child
     virtual_loss: float = 1.0
-    tactical_floor: float = 0.03  # minimum prior handed to a forced capture/check
-    max_sims: int = 200_000
+    tactical_floor: float = 0.02  # minimum prior handed to a forced capture/check
+    contempt: float = 0.08  # draws count this much against the side to move at the root
+    max_sims: int = 1_000_000
 
 
 class Node:
@@ -77,7 +78,7 @@ class PuctSearch:
                 sims += 1
                 terminal = self._terminal_value(leaf_board)
                 if terminal is not None:
-                    self._backup(path, terminal)
+                    self._backup(path, self._with_contempt(terminal, len(path)))
                 else:
                     pending.append((path, leaf_board))
             if pending:
@@ -157,3 +158,10 @@ class PuctSearch:
         ):
             return 0.0
         return None
+
+    def _with_contempt(self, terminal: float, path_len: int) -> float:
+        """Nudge draw scores against the root player so a won game gets played on."""
+        if terminal != 0.0 or not self.config.contempt:
+            return terminal
+        leaf_is_root_side = (path_len - 1) % 2 == 0
+        return -self.config.contempt if leaf_is_root_side else self.config.contempt
