@@ -1,9 +1,14 @@
 """Turn raw public data into training shards.
 
-    python -m training.prepare eval --input data/raw/lichess_db_eval.jsonl.zst \
+    python -m training.prepare eval \
+        --input https://database.lichess.org/lichess_db_eval.jsonl.zst \
         --out data/shards/eval --limit 8000000
-    python -m training.prepare pgn  --input data/raw/elite.pgn.zst \
+    python -m training.prepare pgn --input data/raw/elite.pgn.zst \
         --out data/shards/games --min-elo 2300 --limit 6000000
+
+--input takes a local path or an http(s) URL. A URL is streamed and decompressed
+on the fly, so --limit stops the download early instead of fetching the whole
+(tens of GB) file.
 
 Stream A (eval): Lichess's Stockfish-annotated positions. Value target from the
 deepest eval's score, policy target its best move. Scores in that file are White
@@ -18,8 +23,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import urllib.request
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 import chess
 import chess.pgn
@@ -60,6 +67,7 @@ def iter_eval_samples(lines: Iterable[str], min_depth: int = 12) -> Iterator[Sam
             continue
         if move not in board.legal_moves:
             continue
+        # Lichess eval scores are from White's point of view; flip to side to move.
         cp_white = score_to_cp(pvs[0].get("cp"), pvs[0].get("mate"))
         cp_stm = cp_white if board.turn == chess.WHITE else -cp_white
         yield pack_position(board), move_to_index(board, move), cp_to_wdl(cp_stm)
@@ -91,13 +99,20 @@ def iter_pgn_samples(
             board.push(move)
 
 
-def open_text(path: Path) -> io.TextIOBase:
-    if path.suffix == ".zst":
+def _open_binary(source: str) -> BinaryIO:
+    if source.startswith(("http://", "https://")):
+        return urllib.request.urlopen(source)  # fixed public dataset URLs
+    return Path(source).open("rb")
+
+
+def open_text(source: str) -> io.TextIOBase:
+    raw = _open_binary(source)
+    if source.endswith(".zst"):
         import zstandard
 
-        reader = zstandard.ZstdDecompressor().stream_reader(path.open("rb"))
+        reader = zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True)
         return io.TextIOWrapper(reader, encoding="utf-8")
-    return path.open("r", encoding="utf-8")
+    return io.TextIOWrapper(raw, encoding="utf-8")
 
 
 def _run(samples: Iterator[Sample], out: Path, limit: int) -> None:
@@ -119,13 +134,13 @@ def main() -> None:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     eval_parser = sub.add_parser("eval", help="Lichess Stockfish eval database")
-    eval_parser.add_argument("--input", type=Path, required=True)
+    eval_parser.add_argument("--input", required=True, help="local path or http(s) URL")
     eval_parser.add_argument("--out", type=Path, required=True)
     eval_parser.add_argument("--limit", type=int, default=10_000_000)
     eval_parser.add_argument("--min-depth", type=int, default=12)
 
     pgn_parser = sub.add_parser("pgn", help="PGN archive filtered by rating")
-    pgn_parser.add_argument("--input", type=Path, required=True)
+    pgn_parser.add_argument("--input", required=True, help="local path or http(s) URL")
     pgn_parser.add_argument("--out", type=Path, required=True)
     pgn_parser.add_argument("--limit", type=int, default=10_000_000)
     pgn_parser.add_argument("--min-elo", type=int, default=2200)
