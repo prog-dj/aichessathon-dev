@@ -1,13 +1,13 @@
 """Iterative-deepening alpha-beta over a material + piece-square evaluation.
 
-Shipped in the zip. The value net on one CPU core is too slow to call at every
-node, so the deep search runs on the fast hand-crafted evaluation (~15k
-nodes/s, depth 5-7 in the budget) and the network contributes where it is
-affordable:
-
-- the policy head orders the root moves, so alpha-beta settles quickly
-- the value head is read once per legal root move (one batched call) and
-  combined with that move's search score to pick the move actually played
+Shipped in the zip. The value net on one CPU core is too slow, and too noisy,
+to steer the deep search - letting it order moves or weigh into the evaluation
+made the search measurably weaker. So the search runs entirely on the fast
+hand-crafted evaluation (~15k nodes/s, depth 5-7 in the budget), and the
+network decides only among the root moves the search rates as materially equal
+(within tiebreak_cp of the best). That is most real positions, so the model
+still materially drives the move played - it just cannot throw away material to
+do it.
 
     move = AlphaBetaSearch(evaluator).run(board, deadline_monotonic)
 """
@@ -28,11 +28,11 @@ _INF = 2_000_000
 
 @dataclass(frozen=True)
 class AlphaBetaConfig:
-    net_weight_cp: float = 200.0  # centipawns per unit of value-head output at the root
+    tiebreak_cp: float = 40.0  # net decides among root moves within this of the best
+    value_tiebreak_cp: float = 60.0  # weight of the value head inside the tiebreak
     qsearch_captures: int = 8
     max_depth: int = 40
-    use_net_policy: bool = True
-    use_net_value: bool = True
+    use_net: bool = True
 
 
 class _Timeout(Exception):
@@ -55,15 +55,16 @@ class AlphaBetaSearch:
         if len(legal) == 1:
             return legal[0]
 
+        use_net = self.config.use_net and self.evaluator is not None
         self._priors = {}
         child_value: dict[chess.Move, float] = {}
-        if self.evaluator is not None:
+        if use_net:
+            assert self.evaluator is not None
             self._priors, _ = self.evaluator.evaluate([board])[0]
-            if self.config.use_net_value:
-                child_value = self._root_child_values(board, legal)
+            child_value = self._root_child_values(board, legal)
 
         self._root_scores = {}
-        best = max(legal, key=lambda m: self._priors.get(m, 0.0))
+        best = legal[0]
         for depth in range(1, self.config.max_depth + 1):
             try:
                 # a timeout unwinds without popping; search a fresh copy each pass
@@ -71,14 +72,18 @@ class AlphaBetaSearch:
             except _Timeout:
                 break
 
-        if not self._root_scores:
+        if not use_net or not self._root_scores:
             return best
-        # combine the deep material score with the net's read of each move
-        # (child_value is from the mover-after's view, so subtract it)
-        weight = self.config.net_weight_cp
+        return self._net_pick(child_value)
+
+    def _net_pick(self, child_value: dict[chess.Move, float]) -> chess.Move:
+        """Among root moves the search rates as materially equal, let the net choose."""
+        cutoff = max(self._root_scores.values()) - self.config.tiebreak_cp
+        contenders = [m for m, score in self._root_scores.items() if score >= cutoff]
+        weight = self.config.value_tiebreak_cp
         return max(
-            self._root_scores,
-            key=lambda m: self._root_scores[m] - weight * child_value.get(m, 0.0),
+            contenders,
+            key=lambda m: 100.0 * self._priors.get(m, 0.0) - weight * child_value.get(m, 0.0),
         )
 
     def _root_child_values(
@@ -152,10 +157,9 @@ class AlphaBetaSearch:
     def _ordered(self, board: chess.Board, first: chess.Move | None) -> list[chess.Move]:
         moves = list(board.legal_moves)
 
-        def key(move: chess.Move) -> tuple[bool, float, int]:
-            prior = self._priors.get(move, 0.0) if self.config.use_net_policy else 0.0
+        def key(move: chess.Move) -> tuple[bool, int]:
             capture = _mvv_lva(board, move) if board.is_capture(move) else 0
-            return (move == first, prior, capture)
+            return (move == first, capture)
 
         moves.sort(key=key, reverse=True)
         return moves

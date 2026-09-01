@@ -13,7 +13,7 @@ import pytest
 
 from alphabeta import AlphaBetaConfig, AlphaBetaSearch
 
-_NO_NET = AlphaBetaConfig(use_net_policy=False, use_net_value=False)
+_NO_NET = AlphaBetaConfig(use_net=False)
 
 
 def _run(fen: str, seconds: float = 1.0) -> chess.Move:
