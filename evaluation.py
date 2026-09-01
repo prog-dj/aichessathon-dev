@@ -113,42 +113,53 @@ _MID = {
 }
 _END = {**_MID, chess.PAWN: _PAWN_END, chess.KING: _KING_END}
 
-_PHASE_WEIGHT = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}
-_PHASE_MAX = 24  # 2*(1+1+2) + 2*4, both sides at the start
+_PHASE_MAX = 24  # 2*(N 1 + B 1 + R 2) + 2*(Q 4), both sides at the start
 
 _BISHOP_PAIR = 30
 _TEMPO = 12
 
 
 def _phase(board: chess.Board) -> float:
-    total = sum(
-        weight * len(board.pieces(piece, colour))
-        for piece, weight in _PHASE_WEIGHT.items()
-        for colour in (chess.WHITE, chess.BLACK)
+    total = (
+        chess.popcount(board.knights)
+        + chess.popcount(board.bishops)
+        + 2 * chess.popcount(board.rooks)
+        + 4 * chess.popcount(board.queens)
     )
     return min(total, _PHASE_MAX) / _PHASE_MAX
+
+
+_STATIC = (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)  # tables don't change by phase
+_PHASED = (chess.PAWN, chess.KING)
 
 
 def material_pst_cp(board: chess.Board) -> int:
     """Material + piece-square score, centipawns, side-to-move point of view.
 
-    The piece-square tables interpolate between a midgame and an endgame set by
+    The pawn and king tables interpolate between a midgame and an endgame set by
     game phase, so the king centralises once the queens come off.
     """
+    white = 0.0
+    for piece_type in _STATIC:
+        table = _MID[piece_type]
+        base = _VALUE[piece_type]
+        for square in board.pieces(piece_type, chess.WHITE):
+            white += base + table[square]
+        for square in board.pieces(piece_type, chess.BLACK):
+            white -= base + table[square ^ 56]
+
     phase = _phase(board)
-    stm = board.turn
-    score = 0.0
-    for piece_type, mid in _MID.items():
-        end = _END[piece_type]
+    other = 1.0 - phase
+    for piece_type in _PHASED:
+        mid, end = _MID[piece_type], _END[piece_type]
         base = _VALUE.get(piece_type, 0)
         for square in board.pieces(piece_type, chess.WHITE):
-            value = base + phase * mid[square] + (1.0 - phase) * end[square]
-            score += value if stm == chess.WHITE else -value
+            white += base + phase * mid[square] + other * end[square]
         for square in board.pieces(piece_type, chess.BLACK):
             flipped = square ^ 56
-            value = base + phase * mid[flipped] + (1.0 - phase) * end[flipped]
-            score += -value if stm == chess.WHITE else value
-    return int(score)
+            white -= base + phase * mid[flipped] + other * end[flipped]
+
+    return int(white) if board.turn == chess.WHITE else -int(white)
 
 
 def evaluate_cp(board: chess.Board) -> int:
