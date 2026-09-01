@@ -22,8 +22,8 @@ import chess
 from evaluation import material_pst_cp
 from inference import Evaluator
 
-_MATE = 1_000_000
-_INF = 2_000_000
+_MATE = 1_000_000.0
+_INF = 2_000_000.0
 
 
 @dataclass(frozen=True)
@@ -118,7 +118,7 @@ class AlphaBetaSearch:
         if self._nodes % 1024 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
         if board.is_checkmate():
-            return -_MATE + board.ply()
+            return -_MATE + float(board.ply())
         if board.is_stalemate() or board.is_insufficient_material() or board.is_repetition(3):
             return 0
         if depth <= 0:

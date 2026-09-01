@@ -1,9 +1,10 @@
 """The submission entrypoint. The platform imports this file and calls get_move.
 
-A PUCT search (search.py) guided by the network (inference.py). This file owns
-the two things the search needs from outside the position: a running board that
-carries the game's move history (so repetitions and the fifty-move rule are
-visible in the tree), and a time budget for the current move.
+An iterative-deepening alpha-beta search (alphabeta.py) over a material +
+piece-square evaluation, with the network deciding among the root moves the
+search rates as equal. This file owns the two things the search needs from
+outside the position: a running board carrying the game's move history (so
+repetitions are seen), and a time budget for the current move.
 """
 
 from __future__ import annotations
@@ -14,18 +15,21 @@ from pathlib import Path
 
 import chess
 
+from alphabeta import AlphaBetaSearch
 from inference import Evaluator
-from search import PuctSearch
 
 _MODEL_PATH = Path(__file__).with_name("weights") / "model.onnx"
 _SAFETY_MS = 500  # never plan to use the last half second of the clock
 _PANIC_MS = 4_000
 
 try:
-    _search: PuctSearch | None = PuctSearch(Evaluator(_MODEL_PATH))
-except Exception as error:  # missing or broken weights: still play legal moves
-    print(f"evaluator unavailable, playing random: {error}")
-    _search = None
+    _search: AlphaBetaSearch | None = AlphaBetaSearch(Evaluator(_MODEL_PATH))
+except Exception as error:  # missing or broken weights: search on material alone
+    print(f"evaluator unavailable, searching without the net: {error}")
+    try:
+        _search = AlphaBetaSearch(None)
+    except Exception:
+        _search = None
 
 _board = chess.Board()  # our view of the game, kept in sync across calls
 
@@ -57,8 +61,8 @@ def _matches(a: chess.Board, b: chess.Board) -> bool:
 def _budget_ms(time_left_ms: int, fullmove: int) -> float:
     if time_left_ms < _PANIC_MS:
         return max(20.0, min(time_left_ms * 0.08, 400.0))
-    moves_left = max(14, 44 - fullmove)
-    target = time_left_ms / moves_left + 300.0  # spend the clock plus most of the increment
+    moves_left = max(16, 50 - fullmove)
+    target = time_left_ms / moves_left + 300.0  # the clock share plus part of the increment
     return min(target, time_left_ms - _SAFETY_MS)
 
 

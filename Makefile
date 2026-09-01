@@ -14,8 +14,11 @@ arena:
 test:
 	uv run pytest
 
+ZIP_INCLUDES := --include encoding.py --include inference.py --include evaluation.py \
+	--include alphabeta.py --include search.py
+
 zip:
-	uv run python -m harness.package --include encoding.py --include inference.py --include search.py
+	uv run python -m harness.package $(ZIP_INCLUDES)
 	uv run python -m tools.checkzip
 
 gate:
