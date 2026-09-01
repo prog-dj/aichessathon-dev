@@ -61,7 +61,7 @@ def _matches(a: chess.Board, b: chess.Board) -> bool:
 def _budget_ms(time_left_ms: int, fullmove: int) -> float:
     if time_left_ms < _PANIC_MS:
         return max(20.0, min(time_left_ms * 0.08, 400.0))
-    moves_left = max(16, 50 - fullmove)
+    moves_left = max(20, 55 - fullmove)
     target = time_left_ms / moves_left + 300.0  # the clock share plus part of the increment
     return min(target, time_left_ms - _SAFETY_MS)
 
