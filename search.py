@@ -37,7 +37,7 @@ class PuctConfig:
     max_children: int = 12  # widen only to the top policy moves (+ forced tactics)
     tactical_floor: float = 0.02  # minimum prior handed to a forced capture/check
     contempt: float = 0.0  # draws count this much against the side to move at the root
-    material_blend: float = 0.5  # weight of the material term in the leaf value
+    material_blend: float = 0.35  # weight of the material term in the leaf value
     max_sims: int = 1_000_000
 
 
