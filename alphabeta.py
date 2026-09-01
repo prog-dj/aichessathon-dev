@@ -32,6 +32,7 @@ class AlphaBetaConfig:
     value_tiebreak_cp: float = 60.0  # weight of the value head inside the tiebreak
     qsearch_depth: int = 4  # cap on quiescence plies
     delta_margin_cp: float = 120.0  # skip a capture that cannot get near alpha
+    contempt_cp: float = 30.0  # a draw counts this much against us - play won games on
     max_depth: int = 40
     use_net: bool = True
 
@@ -51,8 +52,10 @@ class AlphaBetaSearch:
         self._deadline = 0.0
         self._nodes = 0
         self._depth_reached = 0
+        self._root_ply = 0
         self._priors: dict[chess.Move, float] = {}
         self._root_scores: dict[chess.Move, float] = {}
+        self._root_exact: set[chess.Move] = set()
         self._tt: dict[object, _TTEntry] = {}
         self._killers: dict[int, list[chess.Move]] = {}
 
@@ -61,6 +64,7 @@ class AlphaBetaSearch:
         self._nodes = 0
         self._tt = {}
         self._killers = {}
+        self._root_ply = board.ply()
         legal = list(board.legal_moves)
         if len(legal) == 1:
             return legal[0]
@@ -74,6 +78,7 @@ class AlphaBetaSearch:
             child_value = self._root_child_values(board, legal)
 
         self._root_scores = {}
+        self._root_exact = set()
         best = legal[0]
         self._depth_reached = 0
         for depth in range(1, self.config.max_depth + 1):
@@ -86,12 +91,16 @@ class AlphaBetaSearch:
 
         if not use_net or not self._root_scores:
             return best
-        return self._net_pick(child_value)
+        return self._net_pick(best, child_value)
 
-    def _net_pick(self, child_value: dict[chess.Move, float]) -> chess.Move:
-        """Among root moves the search rates as materially equal, let the net choose."""
-        cutoff = max(self._root_scores.values()) - self.config.tiebreak_cp
-        contenders = [m for m, score in self._root_scores.items() if score >= cutoff]
+    def _net_pick(self, best: chess.Move, child_value: dict[chess.Move, float]) -> chess.Move:
+        """Among root moves with an exact score near the best, let the net choose."""
+        cutoff = self._root_scores[best] - self.config.tiebreak_cp
+        contenders = [
+            m for m in self._root_exact if self._root_scores.get(m, -_INF) >= cutoff
+        ]
+        if not contenders:
+            return best
         weight = self.config.value_tiebreak_cp
         return max(
             contenders,
@@ -114,27 +123,34 @@ class AlphaBetaSearch:
 
     def _root(self, board: chess.Board, depth: int, prev_best: chess.Move) -> chess.Move:
         best, best_score, alpha = prev_best, -_INF, -_INF
+        exact: set[chess.Move] = set()
+        margin = self.config.tiebreak_cp
         for index, move in enumerate(self._ordered(board, prev_best)):
             board.push(move)
             if index == 0:
-                score = -self._negamax(board, depth - 1, -_INF, -alpha)
+                score = -self._negamax(board, depth - 1, -_INF, _INF)
+                exact.add(move)
             else:
                 score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
-                if score > alpha:
-                    score = -self._negamax(board, depth - 1, -_INF, -alpha)
+                if score >= alpha - margin:  # in tiebreak range: get the exact score
+                    score = -self._negamax(board, depth - 1, -_INF, _INF)
+                    exact.add(move)
             board.pop()
             self._root_scores[move] = score
             if score > best_score:
                 best_score, best = score, move
             alpha = max(alpha, score)
+        self._root_exact = exact
         return best
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
-        if board.halfmove_clock >= 8 and board.is_repetition(3):
-            return 0.0
+        if board.is_insufficient_material() or (
+            board.halfmove_clock >= 8 and (board.is_repetition(3) or board.is_fifty_moves())
+        ):
+            return self._draw_score(board)
         if depth <= 0:
             return self._quiescence(board, alpha, beta)
 
@@ -154,9 +170,9 @@ class AlphaBetaSearch:
                 return e_score
 
         moves = self._ordered(board, tt_move, depth)
-        if not moves:  # no legal move: checkmate if in check, else stalemate
-            return -_MATE + float(board.ply()) if board.is_check() else 0.0
         in_check = board.is_check()
+        if not moves:  # no legal move: checkmate if in check, else stalemate
+            return -_MATE + float(board.ply()) if in_check else self._draw_score(board)
 
         # null-move pruning: if passing still beats beta, this node is winning enough to skip
         if depth >= 3 and not in_check and beta - alpha == 1 and _has_non_pawn_material(board):
@@ -187,6 +203,12 @@ class AlphaBetaSearch:
         flag = _EXACT if alpha_original < best < beta else (_LOWER if best >= beta else _UPPER)
         self._tt[key] = (depth, best, flag, best_move)
         return best
+
+    def _draw_score(self, board: chess.Board) -> float:
+        """A draw, seen from the side to move: negative when it is our turn (so we
+        play a won game on), positive when it is the opponent's."""
+        ours = (board.ply() - self._root_ply) % 2 == 0
+        return -self.config.contempt_cp if ours else self.config.contempt_cp
 
     def _remember_killer(self, depth: int, move: chess.Move) -> None:
         killers = self._killers.setdefault(depth, [])

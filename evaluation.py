@@ -154,16 +154,37 @@ def material_pst_cp(board: chess.Board) -> int:
     return int(white) if board.turn == chess.WHITE else -int(white)
 
 
+_MATE_THRESHOLD = 450  # once this far ahead, start driving the bare king to a corner
+
+
 def evaluate_cp(board: chess.Board) -> int:
     """The search evaluation: material + piece-square, plus a couple of cheap terms."""
     stm = board.turn
-    score = material_pst_cp(board) + _TEMPO
+    material = material_pst_cp(board)
+    score = material + _TEMPO
 
     white_pair = len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2
     black_pair = len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2
     pair = _BISHOP_PAIR * (white_pair - black_pair)
     score += pair if stm == chess.WHITE else -pair
+
+    if abs(material) >= _MATE_THRESHOLD:
+        score += _mate_drive(board, material > 0)
     return score
+
+
+def _mate_drive(board: chess.Board, stm_is_winning: bool) -> int:
+    """Push the losing king to the edge and bring the winning king up. From stm POV."""
+    strong = board.turn if stm_is_winning else not board.turn
+    strong_king, weak_king = board.king(strong), board.king(not strong)
+    if strong_king is None or weak_king is None:
+        return 0
+    wf, wr = weak_king & 7, weak_king >> 3
+    sf, sr = strong_king & 7, strong_king >> 3
+    edge = max(abs(2 * wf - 7), abs(2 * wr - 7))  # 1 (centre) .. 7 (corner)
+    closeness = 14 - (abs(wf - sf) + abs(wr - sr))
+    bonus = 6 * edge + 3 * closeness
+    return bonus if stm_is_winning else -bonus
 
 
 def cp_to_scalar(cp: float, scale: float = 400.0) -> float:
