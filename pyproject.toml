@@ -25,7 +25,9 @@ strict = true
 files = [
     "agent.py",
     "alphabeta.py",
+    "book.py",
     "encoding.py",
+    "endgame.py",
     "evaluation.py",
     "inference.py",
     "search.py",

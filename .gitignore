@@ -12,7 +12,9 @@ submission.zip
 *.pt
 *.ckpt
 *.pgn.zst
-# weights: not tracked in git during development; the final model ships via the
-# zip build, and we decide how to version it (LFS / direct add) near the lock.
+# weights: not tracked in git during development; fetched by training/ scripts
+# and bundled by `make zip`.
 /weights/*.onnx
 /weights/*.onnx.data
+/weights/book.json
+/weights/syzygy/

@@ -17,6 +17,7 @@ import chess
 
 from alphabeta import AlphaBetaSearch
 from book import Book
+from endgame import Tablebase
 from inference import Evaluator
 
 _WEIGHTS = Path(__file__).with_name("weights")
@@ -39,6 +40,14 @@ try:
 except Exception as error:  # no book, or unreadable: just search from move one
     print(f"no opening book: {error}")
     _book = None
+
+_tablebase: Tablebase | None
+try:
+    _tablebase = Tablebase(_WEIGHTS / "syzygy")
+    print("syzygy tablebase loaded")
+except Exception as error:  # no tables: the search handles endgames on its own
+    print(f"no tablebase: {error}")
+    _tablebase = None
 
 _board = chess.Board()  # our view of the game, kept in sync across calls
 
@@ -101,5 +110,21 @@ def get_move(fen: str, time_left_ms: int) -> str:
             print(f"search failed, playing a legal move: {error}")
             chosen = legal[0]
 
+    chosen = _tablebase_guard(board, chosen)
     board.push(chosen)
     return chosen.uci()
+
+
+def _tablebase_guard(board: chess.Board, chosen: chess.Move) -> chess.Move:
+    """Keep the search's move only if it preserves the tablebase result."""
+    if _tablebase is None:
+        return chosen
+    try:
+        approved = _tablebase.best_moves(board)
+    except Exception as error:
+        print(f"tablebase probe failed: {error}")
+        return chosen
+    if approved is None or chosen in approved:
+        return chosen
+    scores = _search._root_scores if _search is not None else {}
+    return max(approved, key=lambda m: scores.get(m, 0.0))

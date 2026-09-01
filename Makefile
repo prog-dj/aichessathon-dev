@@ -15,7 +15,7 @@ test:
 	uv run pytest
 
 ZIP_INCLUDES := --include encoding.py --include inference.py --include evaluation.py \
-	--include alphabeta.py
+	--include alphabeta.py --include book.py --include endgame.py
 
 zip:
 	uv run python -m harness.package $(ZIP_INCLUDES)
