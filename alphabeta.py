@@ -58,12 +58,14 @@ class AlphaBetaSearch:
         self._root_exact: set[chess.Move] = set()
         self._tt: dict[object, _TTEntry] = {}
         self._killers: dict[int, list[chess.Move]] = {}
+        self._history: dict[tuple[bool, int, int], int] = {}
 
     def run(self, board: chess.Board, deadline: float) -> chess.Move:
         self._deadline = deadline
         self._nodes = 0
         self._tt = {}
         self._killers = {}
+        self._history = {}
         self._root_ply = board.ply()
         legal = list(board.legal_moves)
         if len(legal) == 1:
@@ -122,25 +124,32 @@ class AlphaBetaSearch:
         }
 
     def _root(self, board: chess.Board, depth: int, prev_best: chess.Move) -> chess.Move:
+        ordered = self._ordered(board, prev_best)
         best, best_score, alpha = prev_best, -_INF, -_INF
-        exact: set[chess.Move] = set()
-        margin = self.config.tiebreak_cp
-        for index, move in enumerate(self._ordered(board, prev_best)):
+        for index, move in enumerate(ordered):
             board.push(move)
             if index == 0:
                 score = -self._negamax(board, depth - 1, -_INF, _INF)
-                exact.add(move)
             else:
                 score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
-                if score >= alpha - margin:  # in tiebreak range: get the exact score
-                    score = -self._negamax(board, depth - 1, -_INF, _INF)
-                    exact.add(move)
+                if score > alpha:
+                    score = -self._negamax(board, depth - 1, -_INF, -alpha)
             board.pop()
             self._root_scores[move] = score
             if score > best_score:
                 best_score, best = score, move
             alpha = max(alpha, score)
-        self._root_exact = exact
+
+        # second pass, only for the net tiebreak: exact scores for moves near the best
+        self._root_exact = {best}
+        if self.evaluator is not None:
+            cutoff = best_score - self.config.tiebreak_cp
+            for move in ordered:
+                if move != best and self._root_scores.get(move, -_INF) >= cutoff:
+                    board.push(move)
+                    self._root_scores[move] = -self._negamax(board, depth - 1, -_INF, _INF)
+                    board.pop()
+                    self._root_exact.add(move)
         return best
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
@@ -184,20 +193,30 @@ class AlphaBetaSearch:
 
         best, best_move = -_INF, None
         for index, move in enumerate(moves):
+            capture = board.is_capture(move)
             board.push(move)
+            quiet = not capture and not board.is_check()
             if index == 0:
                 score = -self._negamax(board, depth - 1, -beta, -alpha)
-            else:  # principal variation search: scout with a null window, re-search on a hit
-                score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
-                if alpha < score < beta:
+            else:
+                # late-move reduction: search likely-bad quiet moves shallower first
+                reduction = 0
+                if index >= 4 and depth >= 3 and quiet and not in_check:
+                    reduction = 1 + (index >= 10 and depth >= 6)
+                score = -self._negamax(board, depth - 1 - reduction, -alpha - 1, -alpha)
+                if score > alpha:  # scout beat alpha: re-search at full depth and window
                     score = -self._negamax(board, depth - 1, -beta, -alpha)
             board.pop()
             if score > best:
                 best, best_move = score, move
             alpha = max(alpha, score)
             if alpha >= beta:
-                if not board.is_capture(move):
+                if quiet:
                     self._remember_killer(depth, move)
+                    self._history[(board.turn, move.from_square, move.to_square)] = (
+                        self._history.get((board.turn, move.from_square, move.to_square), 0)
+                        + depth * depth
+                    )
                 break
 
         flag = _EXACT if alpha_original < best < beta else (_LOWER if best >= beta else _UPPER)
@@ -245,10 +264,13 @@ class AlphaBetaSearch:
     ) -> list[chess.Move]:
         moves = list(board.legal_moves)
         killers = self._killers.get(depth, ())
+        turn = board.turn
+        history = self._history
 
-        def key(move: chess.Move) -> tuple[bool, int, bool]:
+        def key(move: chess.Move) -> tuple[bool, int, bool, int]:
             capture = _mvv_lva(board, move) if board.is_capture(move) else 0
-            return (move == first, capture, move in killers)
+            hist = history.get((turn, move.from_square, move.to_square), 0)
+            return (move == first, capture, move in killers, hist)
 
         moves.sort(key=key, reverse=True)
         return moves
