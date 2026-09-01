@@ -93,8 +93,12 @@ _TABLES = {
 }
 
 
+_BISHOP_PAIR = 30
+_TEMPO = 12
+
+
 def material_pst_cp(board: chess.Board) -> int:
-    """Centipawn score from the side-to-move point of view."""
+    """Material + piece-square score, centipawns, side-to-move point of view."""
     stm = board.turn
     score = 0
     for piece_type, table in _TABLES.items():
@@ -105,6 +109,18 @@ def material_pst_cp(board: chess.Board) -> int:
         for square in board.pieces(piece_type, chess.BLACK):
             value = base + table[square ^ 56]
             score += -value if stm == chess.WHITE else value
+    return score
+
+
+def evaluate_cp(board: chess.Board) -> int:
+    """The search evaluation: material + piece-square, plus a couple of cheap terms."""
+    stm = board.turn
+    score = material_pst_cp(board) + _TEMPO
+
+    white_pair = len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2
+    black_pair = len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2
+    pair = _BISHOP_PAIR * (white_pair - black_pair)
+    score += pair if stm == chess.WHITE else -pair
     return score
 
 

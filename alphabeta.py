@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import chess
 
-from evaluation import material_pst_cp
+from evaluation import evaluate_cp
 from inference import Evaluator
 
 _MATE = 1_000_000.0
@@ -174,7 +174,7 @@ class AlphaBetaSearch:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
-        stand_pat = float(material_pst_cp(board))
+        stand_pat = float(evaluate_cp(board))
         if stand_pat >= beta:
             return stand_pat
         alpha = max(alpha, stand_pat)
