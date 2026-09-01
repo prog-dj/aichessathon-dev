@@ -39,6 +39,10 @@ class _Timeout(Exception):
     pass
 
 
+_EXACT, _LOWER, _UPPER = 0, 1, 2
+_TTEntry = tuple[int, float, int, chess.Move | None]  # depth, score, flag, best move
+
+
 class AlphaBetaSearch:
     def __init__(self, evaluator: Evaluator | None, config: AlphaBetaConfig | None = None) -> None:
         self.evaluator = evaluator
@@ -47,10 +51,14 @@ class AlphaBetaSearch:
         self._nodes = 0
         self._priors: dict[chess.Move, float] = {}
         self._root_scores: dict[chess.Move, float] = {}
+        self._tt: dict[object, _TTEntry] = {}
+        self._killers: dict[int, list[chess.Move]] = {}
 
     def run(self, board: chess.Board, deadline: float) -> chess.Move:
         self._deadline = deadline
         self._nodes = 0
+        self._tt = {}
+        self._killers = {}
         legal = list(board.legal_moves)
         if len(legal) == 1:
             return legal[0]
@@ -115,7 +123,7 @@ class AlphaBetaSearch:
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
         self._nodes += 1
-        if self._nodes % 1024 == 0 and time.monotonic() >= self._deadline:
+        if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
         if board.is_checkmate():
             return -_MATE + float(board.ply())
@@ -124,18 +132,48 @@ class AlphaBetaSearch:
         if depth <= 0:
             return self._quiescence(board, alpha, beta)
 
-        best = -_INF
-        for move in self._ordered(board, None):
+        key: object = board._transposition_key()
+        alpha_original = alpha
+        entry = self._tt.get(key)
+        tt_move = entry[3] if entry else None
+        if entry is not None and entry[0] >= depth:
+            e_score, e_flag = entry[1], entry[2]
+            if e_flag == _EXACT:
+                return e_score
+            if e_flag == _LOWER:
+                alpha = max(alpha, e_score)
+            else:
+                beta = min(beta, e_score)
+            if alpha >= beta:
+                return e_score
+
+        best, best_move = -_INF, None
+        for move in self._ordered(board, tt_move, depth):
             board.push(move)
             score = -self._negamax(board, depth - 1, -beta, -alpha)
             board.pop()
-            best = max(best, score)
+            if score > best:
+                best, best_move = score, move
             alpha = max(alpha, score)
             if alpha >= beta:
+                if not board.is_capture(move):
+                    self._remember_killer(depth, move)
                 break
+
+        flag = _EXACT if alpha_original < best < beta else (_LOWER if best >= beta else _UPPER)
+        self._tt[key] = (depth, best, flag, best_move)
         return best
 
+    def _remember_killer(self, depth: int, move: chess.Move) -> None:
+        killers = self._killers.setdefault(depth, [])
+        if move not in killers:
+            killers.insert(0, move)
+            del killers[2:]
+
     def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
+        self._nodes += 1
+        if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
+            raise _Timeout
         stand_pat = float(material_pst_cp(board))
         if stand_pat >= beta:
             return stand_pat
@@ -154,12 +192,15 @@ class AlphaBetaSearch:
             alpha = max(alpha, score)
         return alpha
 
-    def _ordered(self, board: chess.Board, first: chess.Move | None) -> list[chess.Move]:
+    def _ordered(
+        self, board: chess.Board, first: chess.Move | None, depth: int = 0
+    ) -> list[chess.Move]:
         moves = list(board.legal_moves)
+        killers = self._killers.get(depth, ())
 
-        def key(move: chess.Move) -> tuple[bool, int]:
+        def key(move: chess.Move) -> tuple[bool, int, bool]:
             capture = _mvv_lva(board, move) if board.is_capture(move) else 0
-            return (move == first, capture)
+            return (move == first, capture, move in killers)
 
         moves.sort(key=key, reverse=True)
         return moves
