@@ -72,7 +72,7 @@ _QUEEN = (
     -10,  0,  0,  0,  0,  0,  0,-10,
     -20,-10,-10, -5, -5,-10,-10,-20,
 )
-_KING = (
+_KING_MID = (
      20, 30, 10,  0,  0, 10, 30, 20,
      20, 20,  0,  0,  0,  0, 20, 20,
     -10,-20,-20,-20,-20,-20,-20,-10,
@@ -82,34 +82,73 @@ _KING = (
     -30,-40,-40,-50,-50,-40,-40,-30,
     -30,-40,-40,-50,-50,-40,-40,-30,
 )
+_KING_END = (
+    -50,-30,-30,-30,-30,-30,-30,-50,
+    -30,-25,  0,  0,  0,  0,-25,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 30, 40, 40, 30,-10,-30,
+    -30,-10, 20, 30, 30, 20,-10,-30,
+    -30,-20,-10,  0,  0,-10,-20,-30,
+    -50,-40,-30,-20,-20,-30,-40,-50,
+)
+_PAWN_END = (
+      0,  0,  0,  0,  0,  0,  0,  0,
+     10, 10, 10, 10, 10, 10, 10, 10,
+     15, 15, 15, 15, 15, 15, 15, 15,
+     25, 25, 25, 25, 25, 25, 25, 25,
+     45, 45, 45, 45, 45, 45, 45, 45,
+     80, 80, 80, 80, 80, 80, 80, 80,
+    130,130,130,130,130,130,130,130,
+      0,  0,  0,  0,  0,  0,  0,  0,
+)
 # fmt: on
-_TABLES = {
+_MID = {
     chess.PAWN: _PAWN,
     chess.KNIGHT: _KNIGHT,
     chess.BISHOP: _BISHOP,
     chess.ROOK: _ROOK,
     chess.QUEEN: _QUEEN,
-    chess.KING: _KING,
+    chess.KING: _KING_MID,
 }
+_END = {**_MID, chess.PAWN: _PAWN_END, chess.KING: _KING_END}
 
+_PHASE_WEIGHT = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}
+_PHASE_MAX = 24  # 2*(1+1+2) + 2*4, both sides at the start
 
 _BISHOP_PAIR = 30
 _TEMPO = 12
 
 
+def _phase(board: chess.Board) -> float:
+    total = sum(
+        weight * len(board.pieces(piece, colour))
+        for piece, weight in _PHASE_WEIGHT.items()
+        for colour in (chess.WHITE, chess.BLACK)
+    )
+    return min(total, _PHASE_MAX) / _PHASE_MAX
+
+
 def material_pst_cp(board: chess.Board) -> int:
-    """Material + piece-square score, centipawns, side-to-move point of view."""
+    """Material + piece-square score, centipawns, side-to-move point of view.
+
+    The piece-square tables interpolate between a midgame and an endgame set by
+    game phase, so the king centralises once the queens come off.
+    """
+    phase = _phase(board)
     stm = board.turn
-    score = 0
-    for piece_type, table in _TABLES.items():
+    score = 0.0
+    for piece_type, mid in _MID.items():
+        end = _END[piece_type]
         base = _VALUE.get(piece_type, 0)
         for square in board.pieces(piece_type, chess.WHITE):
-            value = base + table[square]
+            value = base + phase * mid[square] + (1.0 - phase) * end[square]
             score += value if stm == chess.WHITE else -value
         for square in board.pieces(piece_type, chess.BLACK):
-            value = base + table[square ^ 56]
+            flipped = square ^ 56
+            value = base + phase * mid[flipped] + (1.0 - phase) * end[flipped]
             score += -value if stm == chess.WHITE else value
-    return score
+    return int(score)
 
 
 def evaluate_cp(board: chess.Board) -> int:

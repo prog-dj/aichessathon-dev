@@ -16,20 +16,29 @@ from pathlib import Path
 import chess
 
 from alphabeta import AlphaBetaSearch
+from book import Book
 from inference import Evaluator
 
-_MODEL_PATH = Path(__file__).with_name("weights") / "model.onnx"
+_WEIGHTS = Path(__file__).with_name("weights")
 _SAFETY_MS = 500  # never plan to use the last half second of the clock
 _PANIC_MS = 4_000
 
 try:
-    _search: AlphaBetaSearch | None = AlphaBetaSearch(Evaluator(_MODEL_PATH))
+    _search: AlphaBetaSearch | None = AlphaBetaSearch(Evaluator(_WEIGHTS / "model.onnx"))
 except Exception as error:  # missing or broken weights: search on material alone
     print(f"evaluator unavailable, searching without the net: {error}")
     try:
         _search = AlphaBetaSearch(None)
     except Exception:
         _search = None
+
+_book: Book | None
+try:
+    _book = Book(_WEIGHTS / "book.json")
+    print(f"opening book: {len(_book)} positions")
+except Exception as error:  # no book, or unreadable: just search from move one
+    print(f"no opening book: {error}")
+    _book = None
 
 _board = chess.Board()  # our view of the game, kept in sync across calls
 
@@ -71,17 +80,26 @@ def get_move(fen: str, time_left_ms: int) -> str:
     legal = list(board.legal_moves)
     if not legal:
         return "0000"
+
+    chosen: chess.Move | None = None
     if len(legal) == 1 or _search is None:
-        move = legal[0] if len(legal) == 1 else random.choice(legal)
-        board.push(move)
-        return move.uci()
+        chosen = legal[0] if len(legal) == 1 else random.choice(legal)
+        board.push(chosen)
+        return chosen.uci()
 
-    try:
-        deadline = time.monotonic() + _budget_ms(time_left_ms, board.fullmove_number) / 1000.0
-        move = _search.run(board, deadline)
-    except Exception as error:  # never forfeit on a bug
-        print(f"search failed, playing a legal move: {error}")
-        move = legal[0]
+    if _book is not None and board.fullmove_number <= 16:
+        try:
+            chosen = _book.move(board)
+        except Exception as error:
+            print(f"book lookup failed: {error}")
 
-    board.push(move)
-    return move.uci()
+    if chosen is None:
+        try:
+            deadline = time.monotonic() + _budget_ms(time_left_ms, board.fullmove_number) / 1000.0
+            chosen = _search.run(board, deadline)
+        except Exception as error:  # never forfeit on a bug
+            print(f"search failed, playing a legal move: {error}")
+            chosen = legal[0]
+
+    board.push(chosen)
+    return chosen.uci()
