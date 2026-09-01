@@ -12,7 +12,7 @@ import math
 
 import chess
 
-_VALUE = {
+PIECE_VALUE = {
     chess.PAWN: 100,
     chess.KNIGHT: 320,
     chess.BISHOP: 330,
@@ -129,8 +129,8 @@ def _phase(board: chess.Board) -> float:
     return min(total, _PHASE_MAX) / _PHASE_MAX
 
 
-_STATIC = (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)  # tables don't change by phase
-_PHASED = (chess.PAWN, chess.KING)
+_BASE = tuple(PIECE_VALUE.get(pt, 0) for pt in range(7))  # indexed by piece_type 1..6
+_PHASED = frozenset((chess.PAWN, chess.KING))
 
 
 def material_pst_cp(board: chess.Board) -> int:
@@ -139,26 +139,18 @@ def material_pst_cp(board: chess.Board) -> int:
     The pawn and king tables interpolate between a midgame and an endgame set by
     game phase, so the king centralises once the queens come off.
     """
-    white = 0.0
-    for piece_type in _STATIC:
-        table = _MID[piece_type]
-        base = _VALUE[piece_type]
-        for square in board.pieces(piece_type, chess.WHITE):
-            white += base + table[square]
-        for square in board.pieces(piece_type, chess.BLACK):
-            white -= base + table[square ^ 56]
-
     phase = _phase(board)
     other = 1.0 - phase
-    for piece_type in _PHASED:
-        mid, end = _MID[piece_type], _END[piece_type]
-        base = _VALUE.get(piece_type, 0)
-        for square in board.pieces(piece_type, chess.WHITE):
-            white += base + phase * mid[square] + other * end[square]
-        for square in board.pieces(piece_type, chess.BLACK):
-            flipped = square ^ 56
-            white -= base + phase * mid[flipped] + other * end[flipped]
-
+    white = 0.0
+    for square, piece in board.piece_map().items():
+        piece_type = piece.piece_type
+        sq = square if piece.color == chess.WHITE else square ^ 56
+        if piece_type in _PHASED:
+            table_value = phase * _MID[piece_type][sq] + other * _END[piece_type][sq]
+        else:
+            table_value = _MID[piece_type][sq]
+        value = _BASE[piece_type] + table_value
+        white += value if piece.color == chess.WHITE else -value
     return int(white) if board.turn == chess.WHITE else -int(white)
 
 

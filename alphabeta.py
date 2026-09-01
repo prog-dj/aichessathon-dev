@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import chess
 
-from evaluation import evaluate_cp
+from evaluation import PIECE_VALUE, evaluate_cp
 from inference import Evaluator
 
 _MATE = 1_000_000.0
@@ -30,7 +30,8 @@ _INF = 2_000_000.0
 class AlphaBetaConfig:
     tiebreak_cp: float = 40.0  # net decides among root moves within this of the best
     value_tiebreak_cp: float = 60.0  # weight of the value head inside the tiebreak
-    qsearch_captures: int = 8
+    qsearch_depth: int = 4  # cap on quiescence plies
+    delta_margin_cp: float = 120.0  # skip a capture that cannot get near alpha
     max_depth: int = 40
     use_net: bool = True
 
@@ -49,6 +50,7 @@ class AlphaBetaSearch:
         self.config = config or AlphaBetaConfig()
         self._deadline = 0.0
         self._nodes = 0
+        self._depth_reached = 0
         self._priors: dict[chess.Move, float] = {}
         self._root_scores: dict[chess.Move, float] = {}
         self._tt: dict[object, _TTEntry] = {}
@@ -73,10 +75,12 @@ class AlphaBetaSearch:
 
         self._root_scores = {}
         best = legal[0]
+        self._depth_reached = 0
         for depth in range(1, self.config.max_depth + 1):
             try:
                 # a timeout unwinds without popping; search a fresh copy each pass
                 best = self._root(board.copy(), depth, best)
+                self._depth_reached = depth
             except _Timeout:
                 break
 
@@ -109,26 +113,28 @@ class AlphaBetaSearch:
         }
 
     def _root(self, board: chess.Board, depth: int, prev_best: chess.Move) -> chess.Move:
-        # full window at the root ply so every _root_scores entry is exact and can
-        # be combined with the net value; deeper plies still prune normally
-        best, best_score = prev_best, -_INF
-        for move in self._ordered(board, prev_best):
+        best, best_score, alpha = prev_best, -_INF, -_INF
+        for index, move in enumerate(self._ordered(board, prev_best)):
             board.push(move)
-            score = -self._negamax(board, depth - 1, -_INF, _INF)
+            if index == 0:
+                score = -self._negamax(board, depth - 1, -_INF, -alpha)
+            else:
+                score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
+                if score > alpha:
+                    score = -self._negamax(board, depth - 1, -_INF, -alpha)
             board.pop()
             self._root_scores[move] = score
             if score > best_score:
                 best_score, best = score, move
+            alpha = max(alpha, score)
         return best
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
-        if board.is_checkmate():
-            return -_MATE + float(board.ply())
-        if board.is_stalemate() or board.is_insufficient_material() or board.is_repetition(3):
-            return 0
+        if board.halfmove_clock >= 8 and board.is_repetition(3):
+            return 0.0
         if depth <= 0:
             return self._quiescence(board, alpha, beta)
 
@@ -147,10 +153,28 @@ class AlphaBetaSearch:
             if alpha >= beta:
                 return e_score
 
+        moves = self._ordered(board, tt_move, depth)
+        if not moves:  # no legal move: checkmate if in check, else stalemate
+            return -_MATE + float(board.ply()) if board.is_check() else 0.0
+        in_check = board.is_check()
+
+        # null-move pruning: if passing still beats beta, this node is winning enough to skip
+        if depth >= 3 and not in_check and beta - alpha == 1 and _has_non_pawn_material(board):
+            board.push(chess.Move.null())
+            null_score = -self._negamax(board, depth - 3, -beta, -beta + 1)
+            board.pop()
+            if null_score >= beta and abs(null_score) < _MATE - 1000:
+                return beta
+
         best, best_move = -_INF, None
-        for move in self._ordered(board, tt_move, depth):
+        for index, move in enumerate(moves):
             board.push(move)
-            score = -self._negamax(board, depth - 1, -beta, -alpha)
+            if index == 0:
+                score = -self._negamax(board, depth - 1, -beta, -alpha)
+            else:  # principal variation search: scout with a null window, re-search on a hit
+                score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
+                if alpha < score < beta:
+                    score = -self._negamax(board, depth - 1, -beta, -alpha)
             board.pop()
             if score > best:
                 best, best_move = score, move
@@ -170,22 +194,24 @@ class AlphaBetaSearch:
             killers.insert(0, move)
             del killers[2:]
 
-    def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
+    def _quiescence(self, board: chess.Board, alpha: float, beta: float, qdepth: int = 0) -> float:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
         stand_pat = float(evaluate_cp(board))
-        if stand_pat >= beta:
+        if stand_pat >= beta or qdepth >= self.config.qsearch_depth:
             return stand_pat
         alpha = max(alpha, stand_pat)
+
         captures = sorted(
-            (m for m in board.legal_moves if board.is_capture(m)),
-            key=lambda m: _mvv_lva(board, m),
-            reverse=True,
-        )[: self.config.qsearch_captures]
+            board.generate_legal_captures(), key=lambda m: _mvv_lva(board, m), reverse=True
+        )
         for move in captures:
+            victim = board.piece_type_at(move.to_square) or chess.PAWN
+            if stand_pat + PIECE_VALUE[victim] + self.config.delta_margin_cp < alpha:
+                continue  # delta pruning: even winning this piece won't reach alpha
             board.push(move)
-            score = -self._quiescence(board, -beta, -alpha)
+            score = -self._quiescence(board, -beta, -alpha, qdepth + 1)
             board.pop()
             if score >= beta:
                 return score
@@ -210,3 +236,8 @@ def _mvv_lva(board: chess.Board, move: chess.Move) -> int:
     victim = board.piece_type_at(move.to_square) or 0
     attacker = board.piece_type_at(move.from_square) or 0
     return victim * 10 - attacker
+
+
+def _has_non_pawn_material(board: chess.Board) -> bool:
+    ours = board.occupied_co[board.turn]
+    return bool(ours & (board.knights | board.bishops | board.rooks | board.queens))
