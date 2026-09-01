@@ -1,12 +1,13 @@
 """Iterative-deepening alpha-beta over a material + piece-square evaluation.
 
-Shipped in the zip as an alternative to search.py. The value net on one CPU core
-is too slow to call at every node, so the bulk of the search runs on the fast
-hand-crafted evaluation and the network contributes where it is affordable:
+Shipped in the zip. The value net on one CPU core is too slow to call at every
+node, so the deep search runs on the fast hand-crafted evaluation (~15k
+nodes/s, depth 5-7 in the budget) and the network contributes where it is
+affordable:
 
-- the policy head orders moves at every node, so alpha-beta cutoffs land early
-- the value head is blended into the evaluation for positions near the root
-  (a single batched call per move), where the move choice is actually decided
+- the policy head orders the root moves, so alpha-beta settles quickly
+- the value head is read once per legal root move (one batched call) and
+  combined with that move's search score to pick the move actually played
 
     move = AlphaBetaSearch(evaluator).run(board, deadline_monotonic)
 """
@@ -17,7 +18,6 @@ import time
 from dataclasses import dataclass
 
 import chess
-import chess.polyglot
 
 from evaluation import material_pst_cp
 from inference import Evaluator
@@ -28,11 +28,11 @@ _INF = 2_000_000
 
 @dataclass(frozen=True)
 class AlphaBetaConfig:
-    net_weight_cp: float = 300.0  # centipawns per unit of value-head output
-    net_plies: int = 2  # blend the value head this many plies deep
+    net_weight_cp: float = 200.0  # centipawns per unit of value-head output at the root
     qsearch_captures: int = 8
     max_depth: int = 40
     use_net_policy: bool = True
+    use_net_value: bool = True
 
 
 class _Timeout(Exception):
@@ -46,58 +46,66 @@ class AlphaBetaSearch:
         self._deadline = 0.0
         self._nodes = 0
         self._priors: dict[chess.Move, float] = {}
-        self._net_value: dict[int, float] = {}
+        self._root_scores: dict[chess.Move, float] = {}
 
     def run(self, board: chess.Board, deadline: float) -> chess.Move:
         self._deadline = deadline
         self._nodes = 0
-        self._net_value = {}
         legal = list(board.legal_moves)
         if len(legal) == 1:
             return legal[0]
 
         self._priors = {}
+        child_value: dict[chess.Move, float] = {}
         if self.evaluator is not None:
             self._priors, _ = self.evaluator.evaluate([board])[0]
-            self._prime_net_values(board)
+            if self.config.use_net_value:
+                child_value = self._root_child_values(board, legal)
 
-        # a timeout unwinds through the recursion without popping, so give each
-        # deepening pass a fresh copy and never touch the caller's board
+        self._root_scores = {}
         best = max(legal, key=lambda m: self._priors.get(m, 0.0))
         for depth in range(1, self.config.max_depth + 1):
             try:
+                # a timeout unwinds without popping; search a fresh copy each pass
                 best = self._root(board.copy(), depth, best)
             except _Timeout:
                 break
-        return best
 
-    def _prime_net_values(self, board: chess.Board) -> None:
-        """Batch-evaluate the positions within net_plies of the root, once."""
+        if not self._root_scores:
+            return best
+        # combine the deep material score with the net's read of each move
+        # (child_value is from the mover-after's view, so subtract it)
+        weight = self.config.net_weight_cp
+        return max(
+            self._root_scores,
+            key=lambda m: self._root_scores[m] - weight * child_value.get(m, 0.0),
+        )
+
+    def _root_child_values(
+        self, board: chess.Board, legal: list[chess.Move]
+    ) -> dict[chess.Move, float]:
         assert self.evaluator is not None
-        frontier = [board.copy(stack=False)]
-        boards = list(frontier)
-        for _ in range(self.config.net_plies):
-            nxt: list[chess.Board] = []
-            for parent in frontier:
-                for move in parent.legal_moves:
-                    child = parent.copy(stack=False)
-                    child.push(move)
-                    nxt.append(child)
-            boards.extend(nxt)
-            frontier = nxt
-            if len(boards) > 800:
-                break
-        for probe, (_, value) in zip(boards, self.evaluator.evaluate(boards), strict=True):
-            self._net_value[chess.polyglot.zobrist_hash(probe)] = value
+        children: list[chess.Board] = []
+        for move in legal:
+            board.push(move)
+            children.append(board.copy(stack=False))
+            board.pop()
+        return {
+            move: value
+            for move, (_, value) in zip(legal, self.evaluator.evaluate(children), strict=True)
+        }
 
     def _root(self, board: chess.Board, depth: int, prev_best: chess.Move) -> chess.Move:
-        alpha, best = -_INF, prev_best
+        # full window at the root ply so every _root_scores entry is exact and can
+        # be combined with the net value; deeper plies still prune normally
+        best, best_score = prev_best, -_INF
         for move in self._ordered(board, prev_best):
             board.push(move)
-            score = -self._negamax(board, depth - 1, -_INF, -alpha)
+            score = -self._negamax(board, depth - 1, -_INF, _INF)
             board.pop()
-            if score > alpha:
-                alpha, best = score, move
+            self._root_scores[move] = score
+            if score > best_score:
+                best_score, best = score, move
         return best
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
@@ -123,7 +131,7 @@ class AlphaBetaSearch:
         return best
 
     def _quiescence(self, board: chess.Board, alpha: float, beta: float) -> float:
-        stand_pat = self._evaluate(board)
+        stand_pat = float(material_pst_cp(board))
         if stand_pat >= beta:
             return stand_pat
         alpha = max(alpha, stand_pat)
@@ -140,13 +148,6 @@ class AlphaBetaSearch:
                 return score
             alpha = max(alpha, score)
         return alpha
-
-    def _evaluate(self, board: chess.Board) -> float:
-        score = float(material_pst_cp(board))
-        bonus = self._net_value.get(chess.polyglot.zobrist_hash(board))
-        if bonus is not None:
-            score += self.config.net_weight_cp * bonus
-        return score
 
     def _ordered(self, board: chess.Board, first: chess.Move | None) -> list[chess.Move]:
         moves = list(board.legal_moves)
