@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import chess
 
+from evaluation import cp_to_scalar, material_pst_cp
 from inference import Evaluator
 
 
@@ -36,6 +37,7 @@ class PuctConfig:
     max_children: int = 12  # widen only to the top policy moves (+ forced tactics)
     tactical_floor: float = 0.02  # minimum prior handed to a forced capture/check
     contempt: float = 0.0  # draws count this much against the side to move at the root
+    material_blend: float = 0.5  # weight of the material term in the leaf value
     max_sims: int = 1_000_000
 
 
@@ -86,7 +88,7 @@ class PuctSearch:
                 results = self.evaluator.evaluate([lb for _, lb in pending])
                 for (path, leaf_board), (child_priors, value) in zip(pending, results, strict=True):
                     self._expand(path[-1], leaf_board, child_priors)
-                    self._backup(path, value)
+                    self._backup(path, self._leaf_value(value, leaf_board))
 
         return max(root.children.items(), key=lambda item: item[1].visits)[0]
 
@@ -136,6 +138,13 @@ class PuctSearch:
         }
         total = sum(weights.values()) or 1.0
         node.children = {move: Node(weight / total) for move, weight in weights.items()}
+
+    def _leaf_value(self, net_value: float, board: chess.Board) -> float:
+        blend = self.config.material_blend
+        if blend <= 0.0:
+            return net_value
+        material = cp_to_scalar(material_pst_cp(board))
+        return (1.0 - blend) * net_value + blend * material
 
     def _backup(self, path: list[Node], leaf_value: float) -> None:
         # leaf_value is from the point of view of the side to move at the leaf
