@@ -178,3 +178,28 @@ def index_to_move(board: chess.Board, index: int) -> chess.Move | None:
 def legal_policy_indices(board: chess.Board) -> list[tuple[chess.Move, int]]:
     """Every legal move paired with its policy index, for masking network output."""
     return [(move, move_to_index(board, move)) for move in board.legal_moves]
+
+
+def _build_mirror_planes() -> tuple[int, ...]:
+    """Plane permutation under a horizontal (file) flip: (df, dr) -> (-df, dr)."""
+    mapping = list(range(73))
+    for direction, (file_delta, rank_delta) in enumerate(_QUEEN_DIRS):
+        flipped = _QUEEN_DIRS.index((-file_delta, rank_delta))
+        for distance in range(7):
+            mapping[direction * 7 + distance] = flipped * 7 + distance
+    for index, (file_delta, rank_delta) in enumerate(_KNIGHT_DIRS):
+        mapping[56 + index] = 56 + _KNIGHT_DIRS.index((-file_delta, rank_delta))
+    for direction in range(3):
+        for piece in range(3):
+            flipped_dir = 2 - direction  # file deltas (-1, 0, 1) reverse
+            mapping[64 + 3 * direction + piece] = 64 + 3 * flipped_dir + piece
+    return tuple(mapping)
+
+
+_MIRROR_PLANES = _build_mirror_planes()
+
+
+def mirror_index(index: int) -> int:
+    """Policy index of the same move on the file-mirrored board."""
+    from_square, plane = divmod(index, 73)
+    return (from_square ^ 7) * 73 + _MIRROR_PLANES[plane]

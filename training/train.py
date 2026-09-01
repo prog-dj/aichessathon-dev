@@ -53,12 +53,12 @@ def _soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Ten
 
 
 def _load_shards(
-    paths: list[Path], value_scale: float | None = None
+    paths: list[Path], value_scale: float | None = None, mirror: bool = False
 ) -> ConcatDataset[tuple[torch.Tensor, int, torch.Tensor]]:
     shards: list[ShardDataset] = []
     for parent in paths:
         children = sorted(p for p in parent.glob("[0-9]" * 4) if p.is_dir())
-        shards.extend(ShardDataset(c, value_scale) for c in (children or [parent]))
+        shards.extend(ShardDataset(c, value_scale, mirror) for c in (children or [parent]))
     if not shards:
         raise SystemExit(f"no shards under {paths}")
     return ConcatDataset(shards)
@@ -89,13 +89,14 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--value-weight", type=float, default=2.5)
     parser.add_argument("--val-frac", type=float, default=0.01)
     parser.add_argument(
         "--value-scale",
         type=float,
         help="recompute WDL targets from the stored centipawns at this logistic scale",
     )
+    parser.add_argument("--mirror", action="store_true", help="random horizontal-flip augmentation")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out", type=Path, default=Path("weights"))
     parser.add_argument(
@@ -104,7 +105,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = _load_shards(args.shards, args.value_scale)
+    dataset = _load_shards(args.shards, args.value_scale, args.mirror)
     val_len = max(1, int(len(dataset) * args.val_frac))
     train_set, val_set = random_split(
         dataset, [len(dataset) - val_len, val_len], generator=torch.Generator().manual_seed(0)

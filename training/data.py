@@ -13,6 +13,7 @@ knob (``value_scale``) instead of something baked into the shard.
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -20,17 +21,29 @@ import numpy.typing as npt
 import torch
 from torch.utils.data import Dataset
 
+from encoding import mirror_index
 from training.labels import Wdl, cp_to_wdl
 from training.pack import unpack_position
 
 
+def _mirror_planes(planes: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    """File-flip: reverse the file axis and swap the kingside/queenside castle planes."""
+    flipped = planes[:, :, ::-1].copy()
+    flipped[[12, 13]] = flipped[[13, 12]]
+    flipped[[14, 15]] = flipped[[15, 14]]
+    return flipped
+
+
 class ShardDataset(Dataset[tuple[torch.Tensor, int, torch.Tensor]]):
-    def __init__(self, shard_dir: Path | str, value_scale: float | None = None) -> None:
+    def __init__(
+        self, shard_dir: Path | str, value_scale: float | None = None, mirror: bool = False
+    ) -> None:
         directory = Path(shard_dir)
         self.records: npt.NDArray[np.uint8] = np.load(directory / "records.npy", mmap_mode="r")
         self.policy: npt.NDArray[np.int32] = np.load(directory / "policy.npy", mmap_mode="r")
         self.targets: npt.NDArray[np.float32] = np.load(directory / "targets.npy", mmap_mode="r")
         self.value_scale = value_scale
+        self.mirror = mirror
         if not len(self.records) == len(self.policy) == len(self.targets):
             raise ValueError(f"shard {directory} arrays disagree in length")
 
@@ -39,13 +52,18 @@ class ShardDataset(Dataset[tuple[torch.Tensor, int, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, torch.Tensor]:
         planes = unpack_position(np.asarray(self.records[index]))
+        policy = int(self.policy[index])
         row = np.asarray(self.targets[index])
         cp = float(row[3]) if row.shape[0] > 3 else math.nan
         if self.value_scale is not None and not math.isnan(cp):
             wdl = np.array(cp_to_wdl(cp, scale=self.value_scale), dtype=np.float32)
         else:
             wdl = np.array(row[:3], dtype=np.float32)  # copy: mmap is read-only
-        return torch.from_numpy(planes), int(self.policy[index]), torch.from_numpy(wdl)
+
+        if self.mirror and random.random() < 0.5:
+            planes = _mirror_planes(planes)
+            policy = mirror_index(policy)
+        return torch.from_numpy(planes), policy, torch.from_numpy(wdl)
 
 
 class ShardWriter:

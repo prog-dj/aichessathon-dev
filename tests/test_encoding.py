@@ -14,8 +14,13 @@ from encoding import (
     encode_board,
     index_to_move,
     legal_policy_indices,
+    mirror_index,
     move_to_index,
 )
+
+
+def _flip_file(square: int) -> int:
+    return square ^ 7
 
 
 def _random_positions(count: int, seed: int = 0) -> list[chess.Board]:
@@ -47,6 +52,16 @@ def test_every_legal_move_round_trips(board: chess.Board) -> None:
 def test_legal_indices_are_unique(board: chess.Board) -> None:
     indices = [index for _, index in legal_policy_indices(board)]
     assert len(indices) == len(set(indices))
+
+
+@pytest.mark.parametrize("board", POSITIONS, ids=lambda b: b.fen())
+def test_mirror_index_matches_file_flipped_move(board: chess.Board) -> None:
+    flipped = board.transform(chess.flip_horizontal)
+    for move in board.legal_moves:
+        mirrored_move = chess.Move(
+            _flip_file(move.from_square), _flip_file(move.to_square), move.promotion
+        )
+        assert mirror_index(move_to_index(board, move)) == move_to_index(flipped, mirrored_move)
 
 
 def test_encode_shape_and_determinism() -> None:
