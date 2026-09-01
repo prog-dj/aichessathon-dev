@@ -5,12 +5,16 @@
     python -m training.train --shards data/shards/eval data/shards/games \
         --config medium --epochs 3 --batch 2048 --out weights
 
-Each epoch writes ``weights/model.pt`` and exports ``weights/model.onnx``.
+Each epoch writes ``weights/model.e{n}.pt`` and exports ``weights/model.onnx``.
+If ``GH_TOKEN`` is set in the environment, every export is also force-pushed to
+the ``trained-net`` branch, so a lost Kaggle session never loses the model.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -21,6 +25,27 @@ from torch.utils.data import ConcatDataset, DataLoader, random_split
 from training.data import ShardDataset
 from training.export import export_onnx
 from training.model import CONFIGS, ChessNet, parameter_count
+
+_REPO = "github.com/prog-dj/aichessathon-dev.git"
+
+
+def _push_weights(onnx_path: Path, note: str) -> None:
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        return
+
+    def run(*args: str, check: bool = True) -> None:
+        subprocess.run(args, check=check, capture_output=True, text=True)
+
+    try:
+        run("git", "config", "user.email", "kaggle@bot")
+        run("git", "config", "user.name", "kaggle")
+        run("git", "add", "-f", str(onnx_path))
+        run("git", "commit", "-m", f"trained net: {note}", check=False)
+        run("git", "push", "-f", f"https://{token}@{_REPO}", "HEAD:trained-net")
+        print(f"pushed {onnx_path.name} to trained-net")
+    except subprocess.CalledProcessError as error:
+        print(f"weights push failed: {error.stderr or error}")
 
 
 def _soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -140,6 +165,10 @@ def main() -> None:
         try:
             export_onnx(model, args.out / "model.onnx")
             print(f"saved model.e{epoch}.pt and model.onnx")
+            _push_weights(
+                args.out / "model.onnx",
+                f"{args.config} e{epoch} p{policy_acc:.3f} v{value_acc:.3f}",
+            )
         except Exception as error:  # a bad export must not kill the run
             print(f"epoch {epoch}: ONNX export failed ({error}); checkpoint is still saved")
 
