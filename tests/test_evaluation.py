@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import chess
+import pytest
 
 from evaluation import cp_to_scalar, evaluate_cp, material_pst_cp
 
@@ -32,6 +33,26 @@ def test_bishop_pair_bonus() -> None:
     two_extra = evaluate_cp(two_bishops) - material_pst_cp(two_bishops)
     one_extra = evaluate_cp(one_bishop) - material_pst_cp(one_bishop)
     assert two_extra > one_extra
+
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        chess.STARTING_FEN,
+        "r2q1rk1/1b1nbppp/p2ppn2/1p6/3NP3/1BN1B3/PPP1QPPP/R4RK1 w - - 0 12",
+        "4k3/P7/8/8/8/8/8/4K3 w - - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+    ],
+)
+def test_evaluate_is_colour_symmetric(fen: str) -> None:
+    board = chess.Board(fen)
+    assert evaluate_cp(board) == evaluate_cp(board.mirror())
+
+
+def test_passed_pawn_and_open_file_help() -> None:
+    plain = chess.Board("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1")
+    passed = chess.Board("4k3/8/4P3/8/8/8/8/4K3 w - - 0 1")  # further advanced passer
+    assert evaluate_cp(passed) > evaluate_cp(plain)
 
 
 def test_cp_to_scalar_monotone_and_bounded() -> None:
