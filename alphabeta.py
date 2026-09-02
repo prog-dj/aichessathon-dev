@@ -244,13 +244,17 @@ class AlphaBetaSearch:
             return stand_pat
         alpha = max(alpha, stand_pat)
 
+        opponent = not board.turn
         captures = sorted(
             board.generate_legal_captures(), key=lambda m: _mvv_lva(board, m), reverse=True
         )
         for move in captures:
-            victim = board.piece_type_at(move.to_square) or chess.PAWN
-            if stand_pat + PIECE_VALUE[victim] + self.config.delta_margin_cp < alpha:
+            victim = PIECE_VALUE[board.piece_type_at(move.to_square) or chess.PAWN]
+            if stand_pat + victim + self.config.delta_margin_cp < alpha:
                 continue  # delta pruning: even winning this piece won't reach alpha
+            attacker = PIECE_VALUE.get(board.piece_type_at(move.from_square) or 0, 0)
+            if 0 < victim < attacker and board.is_attacked_by(opponent, move.to_square):
+                continue  # loses material on the recapture: skip
             board.push(move)
             score = -self._quiescence(board, -beta, -alpha, qdepth + 1)
             board.pop()
