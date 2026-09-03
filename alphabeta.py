@@ -85,10 +85,11 @@ class AlphaBetaSearch:
         self._root_exact = set()
         best = legal[0]
         self._depth_reached = 0
+        score = 0.0
         for depth in range(1, self.config.max_depth + 1):
             try:
                 # a timeout unwinds without popping; search a fresh copy each pass
-                best = self._root(board.copy(), depth, best)
+                best, score = self._aspirate(board, depth, best, score)
                 self._depth_reached = depth
             except _Timeout:
                 break
@@ -96,6 +97,21 @@ class AlphaBetaSearch:
         if not use_net or not self._root_scores:
             return best
         return self._net_pick(best, child_value)
+
+    def _aspirate(
+        self, board: chess.Board, depth: int, best: chess.Move, prev_score: float
+    ) -> tuple[chess.Move, float]:
+        if depth <= 3:
+            return self._root(board.copy(), depth, best, -_INF, _INF)
+        delta = 45.0
+        while True:
+            low, high = prev_score - delta, prev_score + delta
+            best, score = self._root(board.copy(), depth, best, low, high)
+            if low < score < high:
+                return best, score
+            delta *= 3.5
+            if delta > 1500.0:  # window keeps failing: give up and search wide
+                return self._root(board.copy(), depth, best, -_INF, _INF)
 
     def _net_pick(self, best: chess.Move, child_value: dict[chess.Move, float]) -> chess.Move:
         """Among root moves with an exact score near the best, let the net choose."""
@@ -125,26 +141,29 @@ class AlphaBetaSearch:
             for move, (_, value) in zip(legal, self.evaluator.evaluate(children), strict=True)
         }
 
-    def _root(self, board: chess.Board, depth: int, prev_best: chess.Move) -> chess.Move:
+    def _root(
+        self, board: chess.Board, depth: int, prev_best: chess.Move, alpha: float, beta: float
+    ) -> tuple[chess.Move, float]:
         ordered = self._ordered(board, prev_best)
-        best, best_score, alpha = prev_best, -_INF, -_INF
+        best, best_score = prev_best, -_INF
+        window = alpha
         for index, move in enumerate(ordered):
             board.push(move)
             if index == 0:
-                score = -self._negamax(board, depth - 1, -_INF, _INF)
+                score = -self._negamax(board, depth - 1, -beta, -window)
             else:
-                score = -self._negamax(board, depth - 1, -alpha - 1, -alpha)
-                if score > alpha:
-                    score = -self._negamax(board, depth - 1, -_INF, -alpha)
+                score = -self._negamax(board, depth - 1, -window - 1, -window)
+                if window < score < beta:
+                    score = -self._negamax(board, depth - 1, -beta, -window)
             board.pop()
             self._root_scores[move] = score
             if score > best_score:
                 best_score, best = score, move
-            alpha = max(alpha, score)
+            window = max(window, score)
 
         # second pass, only for the net tiebreak: exact scores for moves near the best
         self._root_exact = {best}
-        if self.evaluator is not None:
+        if self.evaluator is not None and alpha <= best_score <= beta:
             cutoff = best_score - self.config.tiebreak_cp
             for move in ordered:
                 if move != best and self._root_scores.get(move, -_INF) >= cutoff:
@@ -152,7 +171,7 @@ class AlphaBetaSearch:
                     self._root_scores[move] = -self._negamax(board, depth - 1, -_INF, _INF)
                     board.pop()
                     self._root_exact.add(move)
-        return best
+        return best, best_score
 
     def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
         self._nodes += 1
