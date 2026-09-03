@@ -177,6 +177,11 @@ def _material_pst_white(board: chess.Board) -> float:
     return white
 
 
+def material_pst_white(board: chess.Board) -> float:
+    """Material + piece-square score from White's point of view (the incremental base)."""
+    return _material_pst_white(board)
+
+
 def material_pst_cp(board: chess.Board) -> int:
     """Material + piece-square score, centipawns, side-to-move point of view.
 
@@ -187,17 +192,45 @@ def material_pst_cp(board: chess.Board) -> int:
     return int(white) if board.turn == chess.WHITE else int(-white)
 
 
-def evaluate_cp(board: chess.Board) -> int:
+def evaluate_cp(board: chess.Board, material_white: float | None = None) -> int:
     """The search evaluation: material + piece-square + a handful of cheap terms.
 
     Assembled from White's point of view, then flipped once for the side to move.
+    Pass ``material_white`` to reuse an incrementally-maintained material+PST base.
     """
-    white = _material_pst_white(board) + _positional(board)
+    white = (
+        _material_pst_white(board) if material_white is None else material_white
+    ) + _positional(board)
     if abs(white) >= _MATE_THRESHOLD:
         white += _mate_drive_white(board, white > 0)
     if board.turn == chess.WHITE:
         return int(white) + _TEMPO
     return int(-white) + _TEMPO
+
+
+def mpst_quiet_delta(board: chess.Board, move: chess.Move) -> float | None:
+    """White-POV change in material_pst_white for a quiet, non-promotion move.
+
+    Returns None for captures/promotions/castling/en passant - the caller then
+    recomputes from scratch (phase can shift, rook also moves, etc.).
+    """
+    if move.promotion or board.is_capture(move) or board.is_castling(move):
+        return None
+    piece = board.piece_type_at(move.from_square)
+    if piece is None:
+        return None
+    white = piece != 0 and board.color_at(move.from_square) == chess.WHITE
+    src = move.from_square if white else move.from_square ^ 56
+    dst = move.to_square if white else move.to_square ^ 56
+    if piece in _PHASED:
+        phase = _phase(board)
+        other = 1.0 - phase
+        mid, end = _MID[piece], _END[piece]
+        delta = phase * (mid[dst] - mid[src]) + other * (end[dst] - end[src])
+    else:
+        table = _MID[piece]
+        delta = float(table[dst] - table[src])
+    return delta if white else -delta
 
 
 def _positional(board: chess.Board) -> int:

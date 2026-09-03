@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import chess
 
-from evaluation import PIECE_VALUE, evaluate_cp
+from evaluation import PIECE_VALUE, evaluate_cp, material_pst_white, mpst_quiet_delta
 from inference import Evaluator
 
 _MATE = 1_000_000.0
@@ -33,6 +33,8 @@ class AlphaBetaConfig:
     qsearch_depth: int = 4  # cap on quiescence plies
     delta_margin_cp: float = 120.0  # skip a capture that cannot get near alpha
     contempt_cp: float = 30.0  # a draw counts this much against us - play won games on
+    rfp_margin_cp: float = 75.0  # reverse-futility margin per ply
+    futility_margin_cp: float = 100.0  # frontier futility margin per ply
     max_depth: int = 40
     use_net: bool = True
 
@@ -145,16 +147,19 @@ class AlphaBetaSearch:
         self, board: chess.Board, depth: int, prev_best: chess.Move, alpha: float, beta: float
     ) -> tuple[chess.Move, float]:
         ordered = self._ordered(board, prev_best)
+        mw = material_pst_white(board)
         best, best_score = prev_best, -_INF
         window = alpha
         for index, move in enumerate(ordered):
+            delta = mpst_quiet_delta(board, move)
+            child_mw = None if delta is None else mw + delta
             board.push(move)
             if index == 0:
-                score = -self._negamax(board, depth - 1, -beta, -window)
+                score = -self._negamax(board, depth - 1, -beta, -window, child_mw)
             else:
-                score = -self._negamax(board, depth - 1, -window - 1, -window)
+                score = -self._negamax(board, depth - 1, -window - 1, -window, child_mw)
                 if window < score < beta:
-                    score = -self._negamax(board, depth - 1, -beta, -window)
+                    score = -self._negamax(board, depth - 1, -beta, -window, child_mw)
             board.pop()
             self._root_scores[move] = score
             if score > best_score:
@@ -168,12 +173,14 @@ class AlphaBetaSearch:
             for move in ordered:
                 if move != best and self._root_scores.get(move, -_INF) >= cutoff:
                     board.push(move)
-                    self._root_scores[move] = -self._negamax(board, depth - 1, -_INF, _INF)
+                    self._root_scores[move] = -self._negamax(board, depth - 1, -_INF, _INF, None)
                     board.pop()
                     self._root_exact.add(move)
         return best, best_score
 
-    def _negamax(self, board: chess.Board, depth: int, alpha: float, beta: float) -> float:
+    def _negamax(
+        self, board: chess.Board, depth: int, alpha: float, beta: float, mw: float | None
+    ) -> float:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
@@ -181,8 +188,10 @@ class AlphaBetaSearch:
             board.halfmove_clock >= 8 and (board.is_repetition(3) or board.is_fifty_moves())
         ):
             return self._draw_score(board)
+        if mw is None:
+            mw = material_pst_white(board)
         if depth <= 0:
-            return self._quiescence(board, alpha, beta)
+            return self._quiescence(board, alpha, beta, 0, mw)
 
         key: object = board._transposition_key()
         alpha_original = alpha
@@ -204,33 +213,55 @@ class AlphaBetaSearch:
         if not moves:  # no legal move: checkmate if in check, else stalemate
             return -_MATE + float(board.ply()) if in_check else self._draw_score(board)
 
+        non_pv = beta - alpha == 1
+        static_eval = None if in_check else float(evaluate_cp(board, material_white=mw))
+
+        # reverse futility: the position is already so good a search is not needed
+        if (
+            static_eval is not None
+            and non_pv
+            and depth <= 6
+            and abs(beta) < _MATE - 1000
+            and static_eval - self.config.rfp_margin_cp * depth >= beta
+        ):
+            return static_eval
+
         # null-move pruning: if passing still beats beta, this node is winning enough to skip
-        if depth >= 3 and not in_check and beta - alpha == 1 and _has_non_pawn_material(board):
+        if depth >= 3 and not in_check and non_pv and _has_non_pawn_material(board):
             board.push(chess.Move.null())
-            null_score = -self._negamax(board, depth - 3, -beta, -beta + 1)
+            null_score = -self._negamax(board, depth - 3, -beta, -beta + 1, mw)
             board.pop()
             if null_score >= beta and abs(null_score) < _MATE - 1000:
                 return beta
 
+        futile = (
+            static_eval is not None
+            and depth <= 3
+            and static_eval + self.config.futility_margin_cp * depth <= alpha
+        )
         deep = board.ply() - self._root_ply < 2 * max(depth, self._depth_reached) + 4
         best, best_move = -_INF, None
         for index, move in enumerate(moves):
             capture = board.is_capture(move)
-            board.push(move)
-            gives_check = board.is_check()
+            gives_check = board.gives_check(move)
             quiet = not capture and not gives_check
+            if futile and index > 0 and quiet and best > -_MATE + 1000:
+                continue  # frontier futility: this quiet move cannot lift alpha
+            delta = None if not quiet else mpst_quiet_delta(board, move)
+            child_mw = None if delta is None else mw + delta
+            board.push(move)
             # check extension: follow forcing lines a ply further
             child_depth = depth if (gives_check and deep) else depth - 1
             if index == 0:
-                score = -self._negamax(board, child_depth, -beta, -alpha)
+                score = -self._negamax(board, child_depth, -beta, -alpha, child_mw)
             else:
                 # late-move reduction: search likely-bad quiet moves shallower first
                 reduction = 0
                 if index >= 4 and depth >= 3 and quiet and not in_check:
                     reduction = 1 + (index >= 10 and depth >= 6)
-                score = -self._negamax(board, child_depth - reduction, -alpha - 1, -alpha)
+                score = -self._negamax(board, child_depth - reduction, -alpha - 1, -alpha, child_mw)
                 if score > alpha:  # scout beat alpha: re-search at full depth and window
-                    score = -self._negamax(board, child_depth, -beta, -alpha)
+                    score = -self._negamax(board, child_depth, -beta, -alpha, child_mw)
             board.pop()
             if score > best:
                 best, best_move = score, move
@@ -260,11 +291,13 @@ class AlphaBetaSearch:
             killers.insert(0, move)
             del killers[2:]
 
-    def _quiescence(self, board: chess.Board, alpha: float, beta: float, qdepth: int = 0) -> float:
+    def _quiescence(
+        self, board: chess.Board, alpha: float, beta: float, qdepth: int, mw: float | None
+    ) -> float:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
-        stand_pat = float(evaluate_cp(board))
+        stand_pat = float(evaluate_cp(board, material_white=mw))
         if stand_pat >= beta or qdepth >= self.config.qsearch_depth:
             return stand_pat
         alpha = max(alpha, stand_pat)
@@ -281,7 +314,7 @@ class AlphaBetaSearch:
             if 0 < victim < attacker and board.is_attacked_by(opponent, move.to_square):
                 continue  # loses material on the recapture: skip
             board.push(move)
-            score = -self._quiescence(board, -beta, -alpha, qdepth + 1)
+            score = -self._quiescence(board, -beta, -alpha, qdepth + 1, None)
             board.pop()
             if score >= beta:
                 return score

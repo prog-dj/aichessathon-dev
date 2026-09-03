@@ -49,6 +49,26 @@ def test_evaluate_is_colour_symmetric(fen: str) -> None:
     assert evaluate_cp(board) == evaluate_cp(board.mirror())
 
 
+def test_incremental_material_matches_recompute() -> None:
+    import random
+
+    from evaluation import material_pst_white, mpst_quiet_delta
+
+    rng = random.Random(0)
+    for _ in range(60):
+        board = chess.Board()
+        mw = material_pst_white(board)
+        for _ in range(rng.randint(0, 40)):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            move = rng.choice(moves)
+            delta = mpst_quiet_delta(board, move)
+            board.push(move)
+            mw = mw + delta if delta is not None else material_pst_white(board)
+            assert abs(mw - material_pst_white(board)) < 0.01
+
+
 def test_passed_pawn_and_open_file_help() -> None:
     plain = chess.Board("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1")
     passed = chess.Board("4k3/8/4P3/8/8/8/8/4K3 w - - 0 1")  # further advanced passer
