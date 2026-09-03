@@ -30,7 +30,7 @@ _INF = 2_000_000.0
 class AlphaBetaConfig:
     tiebreak_cp: float = 40.0  # net decides among root moves within this of the best
     value_tiebreak_cp: float = 60.0  # weight of the value head inside the tiebreak
-    qsearch_depth: int = 4  # cap on quiescence plies
+    qsearch_depth: int = 8  # safety cap on quiescence plies (delta pruning ends most lines sooner)
     delta_margin_cp: float = 120.0  # skip a capture that cannot get near alpha
     contempt_cp: float = 30.0  # a draw counts this much against us - play won games on
     rfp_margin_cp: float = 75.0  # reverse-futility margin per ply
@@ -185,7 +185,10 @@ class AlphaBetaSearch:
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
         if board.is_insufficient_material() or (
-            board.halfmove_clock >= 8 and (board.is_repetition(3) or board.is_fifty_moves())
+            board.halfmove_clock >= 4
+            # a position seen once already is a draw in the tree: if we can reach
+            # it twice we can reach it a third time and the opponent claims.
+            and (board.is_repetition(2) or board.is_fifty_moves())
         ):
             return self._draw_score(board)
         if mw is None:

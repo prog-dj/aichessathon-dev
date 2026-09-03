@@ -23,6 +23,7 @@ from inference import Evaluator
 _WEIGHTS = Path(__file__).with_name("weights")
 _SAFETY_MS = 500  # never plan to use the last half second of the clock
 _PANIC_MS = 4_000
+_INCREMENT_MS = 500  # fixed 0.5s/move from the tournament time control
 
 try:
     _search: AlphaBetaSearch | None = AlphaBetaSearch(Evaluator(_WEIGHTS / "model.onnx"))
@@ -80,7 +81,9 @@ def _budget_ms(time_left_ms: int, fullmove: int) -> float:
     if time_left_ms < _PANIC_MS:
         return max(20.0, min(time_left_ms * 0.08, 400.0))
     moves_left = max(20, 55 - fullmove)
-    target = time_left_ms / moves_left + 300.0  # the clock share plus part of the increment
+    # base share of the remaining clock, plus almost the whole increment - the
+    # increment refills every move, so spending it keeps the base clock flat.
+    target = (time_left_ms - _SAFETY_MS) / moves_left + 0.9 * _INCREMENT_MS
     return min(target, time_left_ms - _SAFETY_MS)
 
 
