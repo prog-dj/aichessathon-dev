@@ -14,10 +14,10 @@ import chess
 
 PIECE_VALUE = {
     chess.PAWN: 100,
-    chess.KNIGHT: 320,
-    chess.BISHOP: 330,
-    chess.ROOK: 500,
-    chess.QUEEN: 900,
+    chess.KNIGHT: 338,
+    chess.BISHOP: 350,
+    chess.ROOK: 530,
+    chess.QUEEN: 960,
 }
 
 # midgame piece-square tables, White's view, a1..h8; Black mirrors vertically.
@@ -152,10 +152,10 @@ _PASSED_W = tuple(
 _PASSED_B = tuple(
     (_FILE_OF[sq] | _ADJ_FILES[sq]) & _front_span(sq, False) for sq in range(64)
 )
-_PASSED_BONUS = (0, 8, 12, 22, 40, 66, 100, 0)  # by rank of the pawn (0..7)
-_ROOK_OPEN = 22
-_ROOK_HALF_OPEN = 10
-_KING_SHIELD = 12  # per pawn in front of a castled king
+_PASSED_BONUS = (0, 8, 13, 23, 42, 70, 106, 0)  # by rank of the pawn (0..7)
+_ROOK_OPEN = 26
+_ROOK_HALF_OPEN = 12
+_KING_SHIELD = 16  # per pawn in front of a castled king
 
 
 _MATE_THRESHOLD = 450  # once this far ahead, start driving the bare king to a corner
