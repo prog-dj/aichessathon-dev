@@ -68,6 +68,8 @@ class AlphaBetaSearch:
         self._history = {}
         self._root_ply = board.ply()
         legal = list(board.legal_moves)
+        if not legal:
+            raise ValueError("search called on a position with no legal moves")
         if len(legal) == 1:
             return legal[0]
 
@@ -191,21 +193,25 @@ class AlphaBetaSearch:
             if null_score >= beta and abs(null_score) < _MATE - 1000:
                 return beta
 
+        deep = board.ply() - self._root_ply < 2 * max(depth, self._depth_reached) + 4
         best, best_move = -_INF, None
         for index, move in enumerate(moves):
             capture = board.is_capture(move)
             board.push(move)
-            quiet = not capture and not board.is_check()
+            gives_check = board.is_check()
+            quiet = not capture and not gives_check
+            # check extension: follow forcing lines a ply further
+            child_depth = depth if (gives_check and deep) else depth - 1
             if index == 0:
-                score = -self._negamax(board, depth - 1, -beta, -alpha)
+                score = -self._negamax(board, child_depth, -beta, -alpha)
             else:
                 # late-move reduction: search likely-bad quiet moves shallower first
                 reduction = 0
                 if index >= 4 and depth >= 3 and quiet and not in_check:
                     reduction = 1 + (index >= 10 and depth >= 6)
-                score = -self._negamax(board, depth - 1 - reduction, -alpha - 1, -alpha)
+                score = -self._negamax(board, child_depth - reduction, -alpha - 1, -alpha)
                 if score > alpha:  # scout beat alpha: re-search at full depth and window
-                    score = -self._negamax(board, depth - 1, -beta, -alpha)
+                    score = -self._negamax(board, child_depth, -beta, -alpha)
             board.pop()
             if score > best:
                 best, best_move = score, move
