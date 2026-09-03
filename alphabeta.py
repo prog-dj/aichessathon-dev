@@ -166,16 +166,22 @@ class AlphaBetaSearch:
                 best_score, best = score, move
             window = max(window, score)
 
-        # second pass, only for the net tiebreak: exact scores for moves near the best
+        # second pass, only for the net tiebreak: pin down moves near the best.
+        # A narrow window around the cutoff is enough - we only need to know
+        # whether the true score clears best - tiebreak_cp, not its exact value -
+        # and it is far cheaper than a full-width re-search of every contender.
         self._root_exact = {best}
         if self.evaluator is not None and alpha <= best_score <= beta:
             cutoff = best_score - self.config.tiebreak_cp
+            low, high = cutoff - 1.0, best_score + 1.0
             for move in ordered:
                 if move != best and self._root_scores.get(move, -_INF) >= cutoff:
                     board.push(move)
-                    self._root_scores[move] = -self._negamax(board, depth - 1, -_INF, _INF, None)
+                    verified = -self._negamax(board, depth - 1, -high, -low, None)
                     board.pop()
-                    self._root_exact.add(move)
+                    self._root_scores[move] = verified
+                    if verified > cutoff:
+                        self._root_exact.add(move)
         return best, best_score
 
     def _negamax(
