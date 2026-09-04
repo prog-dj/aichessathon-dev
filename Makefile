@@ -14,8 +14,8 @@ arena:
 test:
 	uv run pytest
 
-ZIP_INCLUDES := --include encoding.py --include inference.py --include evaluation.py \
-	--include alphabeta.py --include book.py --include endgame.py
+ZIP_INCLUDES := --include fastchess.py --include encoding.py --include inference.py \
+	--include evaluation.py --include alphabeta.py --include book.py --include endgame.py
 
 zip:
 	uv run python -m harness.package $(ZIP_INCLUDES)

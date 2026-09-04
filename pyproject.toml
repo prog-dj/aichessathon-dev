@@ -20,6 +20,11 @@ target-version = "py312"
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 ignore = ["N818"]
 
+[tool.ruff.lint.per-file-ignores]
+# fastchess.py is a numba dialect: single-letter uint/int aliases, tight
+# paired statements in the move loops, and explicit comparisons the JIT likes.
+"fastchess.py" = ["E702", "E741", "SIM108", "SIM109", "SIM114", "N806", "N803"]
+
 [tool.mypy]
 strict = true
 files = [
@@ -36,8 +41,12 @@ files = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["chess.*", "onnxruntime.*", "chessathon_engine.*"]
+module = ["chess.*", "onnxruntime.*", "numba.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["fastchess"]
+ignore_errors = true  # numba dialect - not meaningfully checkable by mypy
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

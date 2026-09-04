@@ -1,12 +1,13 @@
 """The submission entrypoint. The platform imports this file and calls get_move.
 
-The move is chosen by ``chessathon_engine`` - a Rust bitboard engine
-(alpha-beta, PVS, TT, NNUE-ready evaluation) installed from PyPI via
-requirements.txt. If that import fails for any reason, we fall back to the
-pure-Python engine in ``alphabeta.py`` so a bad wheel never costs a game.
+The move is chosen by ``fastchess`` - a numba-JIT bitboard engine (magic
+move generation, iterative-deepening PVS alpha-beta with a transposition
+table, killers, history, null move, LMR and a tapered hand evaluation),
+compiled to native code at import. If numba is missing or a compile fails
+we fall back to the pure-Python engine in ``alphabeta.py``.
 
-This file owns the two things the engine needs from outside the position: the
-game's move history (so repetitions are seen) and a time budget per move.
+This file owns the two things the engine needs from outside the position:
+the game's move history (so repetitions are seen) and a per-move time budget.
 """
 
 from __future__ import annotations
@@ -22,20 +23,19 @@ _SAFETY_MS = 500  # never plan to use the last half second of the clock
 _PANIC_MS = 4_000
 _INCREMENT_MS = 500  # fixed 0.5s/move from the tournament time control
 
-# --- the Rust engine, if the wheel loaded -----------------------------------
-_engine = None
+# --- the numba engine, compiled at import --------------------------------
+_fast = None
 try:
-    import chessathon_engine as _ce
+    import fastchess
 
-    _ce.init()
-    _engine = _ce
-    print(f"engine: {_ce.version()}")
-except Exception as error:  # no wheel, wrong platform, import error
-    print(f"rust engine unavailable, using the python fallback: {error}")
+    _fast = fastchess.Engine()  # type: ignore[no-untyped-call]
+    print("engine: fastchess (numba)")
+except Exception as error:
+    print(f"fastchess unavailable, using the python fallback: {error}")
 
-# --- pure-Python fallback --------------------------------------------------
+# --- pure-Python fallback ------------------------------------------------
 _fallback = None
-if _engine is None:
+if _fast is None:
     try:
         from alphabeta import AlphaBetaSearch
         from inference import Evaluator
@@ -66,8 +66,8 @@ try:
 except Exception as error:
     print(f"no tablebase: {error}")
 
-_board = chess.Board()  # our view of the game, kept in sync across calls
-_root_fen = chess.STARTING_FEN  # the position _board's move_stack starts from
+_board = chess.Board()
+_root_fen = chess.STARTING_FEN
 
 
 def _sync(fen: str) -> chess.Board:
@@ -76,12 +76,12 @@ def _sync(fen: str) -> chess.Board:
     target = chess.Board(fen)
     if _matches(_board, target):
         return _board
-    for move in _board.legal_moves:  # the opponent's reply gets us there
+    for move in _board.legal_moves:
         _board.push(move)
         if _matches(_board, target):
             return _board
         _board.pop()
-    _board = target  # desynced (first move, or a skipped position): history is lost
+    _board = target
     _root_fen = fen
     return _board
 
@@ -103,9 +103,7 @@ def _budget_ms(time_left_ms: int, fullmove: int) -> tuple[float, float]:
     moves_left = max(20, 55 - fullmove)
     soft = (time_left_ms - _SAFETY_MS) / moves_left + 0.9 * _INCREMENT_MS
     soft = min(soft, time_left_ms - _SAFETY_MS)
-    # hard cap bounds the overshoot from the depth that is still running when the
-    # soft target passes; ~1.7x keeps a bad case from eating the next few moves.
-    hard = min(soft * 1.7, time_left_ms - _SAFETY_MS)
+    hard = min(soft * 1.8, time_left_ms - _SAFETY_MS)
     return soft, hard
 
 
@@ -128,7 +126,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     if chosen is None:
         soft, hard = _budget_ms(time_left_ms, board.fullmove_number)
-        chosen = _engine_move(soft, hard) or _fallback_move(board, soft)
+        chosen = _fast_move(soft, hard) or _fallback_move(board, soft)
         if chosen is None:
             chosen = legal[0]
 
@@ -137,12 +135,14 @@ def get_move(fen: str, time_left_ms: int) -> str:
     return chosen.uci()
 
 
-def _engine_move(soft: float, hard: float) -> chess.Move | None:
-    if _engine is None:
+def _fast_move(soft: float, hard: float) -> chess.Move | None:
+    if _fast is None:
         return None
     try:
         history = [m.uci() for m in _board.move_stack]
-        uci = _engine.best_move(_root_fen, int(soft), int(hard), history)
+        uci, _score, _depth, _nodes = _fast.best_move(  # type: ignore[no-untyped-call]
+            _root_fen, history, int(soft), int(hard)
+        )
         return chess.Move.from_uci(uci)
     except Exception as error:  # never forfeit on an engine bug
         print(f"engine move failed, falling back: {error}")
