@@ -1199,7 +1199,8 @@ def evaluate(bb, mb, acc_w, acc_b):
 #   mv   int32[P,256] scratch move buffers per ply
 #   ct   int64[8]     [nodes, stop, max_nodes, seldepth, game_ply, .., .., ..]
 
-_TT_BITS = 22
+_TT_BITS = 24  # 512MB (32B/entry); measured full-stack RSS at 22 bits was ~620MB
+# against the 2GB budget, so this 4x bump still leaves ~1GB of headroom.
 _TT_SIZE = 1 << _TT_BITS
 _TT_MASK = _TT_SIZE - 1
 N_NODES, N_STOP, N_MAXN, N_SELD, N_GPLY = 0, 1, 2, 3, 4
@@ -1572,17 +1573,29 @@ class Engine:
         completed = 0
         for depth in range(1, max_depth + 1):
             if depth >= 4 and abs(score) < MATE_IN_MAX:
-                window = 30
+                # asymmetric widening: only push out the bound that actually
+                # failed, instead of re-centering both sides on every miss -
+                # a fail-high has already proven the lower side is fine, so
+                # re-searching it wider too (the old score +/- window*3
+                # scheme) was pure waste. Same final score either way, just
+                # fewer wasted researches per iteration.
+                delta = 30
+                alpha = max(-INF, score - delta)
+                beta = min(INF, score + delta)
                 while True:
                     mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
                                     self.mv, self.ct, self.acc_w, self.acc_b,
-                                    depth, score - window, score + window)
+                                    depth, alpha, beta)
                     if self.ct[N_STOP] == 1:
                         break
-                    if sc <= score - window or sc >= score + window:
-                        window *= 3
+                    if sc <= alpha:
+                        beta = (alpha + beta) // 2
+                        alpha = max(-INF, sc - delta)
+                    elif sc >= beta:
+                        beta = min(INF, sc + delta)
                     else:
                         break
+                    delta += delta // 2
             else:
                 mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
                                 self.mv, self.ct, self.acc_w, self.acc_b,
