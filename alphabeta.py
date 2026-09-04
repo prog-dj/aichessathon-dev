@@ -222,26 +222,7 @@ class AlphaBetaSearch:
         if not moves:  # no legal move: checkmate if in check, else stalemate
             return -_MATE + float(board.ply()) if in_check else self._draw_score(board)
 
-        non_pv = beta - alpha == 1
         static_eval = None if in_check else float(evaluate_cp(board, material_white=mw))
-
-        # reverse futility: the position is already so good a search is not needed
-        if (
-            static_eval is not None
-            and non_pv
-            and depth <= 6
-            and abs(beta) < _MATE - 1000
-            and static_eval - self.config.rfp_margin_cp * depth >= beta
-        ):
-            return static_eval
-
-        # null-move pruning: if passing still beats beta, this node is winning enough to skip
-        if depth >= 3 and not in_check and non_pv and _has_non_pawn_material(board):
-            board.push(chess.Move.null())
-            null_score = -self._negamax(board, depth - 3, -beta, -beta + 1, mw)
-            board.pop()
-            if null_score >= beta and abs(null_score) < _MATE - 1000:
-                return beta
 
         futile = (
             static_eval is not None
@@ -306,21 +287,49 @@ class AlphaBetaSearch:
         self._nodes += 1
         if self._nodes % 256 == 0 and time.monotonic() >= self._deadline:
             raise _Timeout
-        stand_pat = float(evaluate_cp(board, material_white=mw))
-        if stand_pat >= beta or qdepth >= self.config.qsearch_depth:
-            return stand_pat
-        alpha = max(alpha, stand_pat)
+
+        in_check = board.is_check()
+        if not in_check:
+            stand_pat = float(evaluate_cp(board, material_white=mw))
+            if stand_pat >= beta:
+                return stand_pat
+            alpha = max(alpha, stand_pat)
+            captures = list(board.generate_legal_captures())
+            checks = [move for move in board.legal_moves if board.gives_check(move)]
+            max_qdepth = self.config.qsearch_depth + 2
+            if qdepth >= max_qdepth:
+                return alpha
+            moves = checks if qdepth >= self.config.qsearch_depth else captures + checks
+        else:
+            # A checked side has no legal stand-pat score. Search every evasion,
+            # including quiet king moves and interpositions.
+            stand_pat = -_INF
+            moves = list(board.legal_moves)
 
         opponent = not board.turn
-        captures = sorted(
-            board.generate_legal_captures(), key=lambda m: _mvv_lva(board, m), reverse=True
+        moves.sort(
+            key=lambda m: (_mvv_lva(board, m) if board.is_capture(m) else 0, board.gives_check(m)),
+            reverse=True,
         )
-        for move in captures:
+        for move in moves:
+            gives_check = board.gives_check(move)
             victim = PIECE_VALUE[board.piece_type_at(move.to_square) or chess.PAWN]
-            if stand_pat + victim + self.config.delta_margin_cp < alpha:
-                continue  # delta pruning: even winning this piece won't reach alpha
+            # Delta pruning is only safe for quiet captures. A checking move can
+            # force a tactical continuation even when its immediate material gain is small.
+            if (
+                not in_check
+                and not gives_check
+                and not board.is_en_passant(move)
+                and stand_pat + victim + self.config.delta_margin_cp < alpha
+            ):
+                continue
             attacker = PIECE_VALUE.get(board.piece_type_at(move.from_square) or 0, 0)
-            if 0 < victim < attacker and board.is_attacked_by(opponent, move.to_square):
+            if (
+                not in_check
+                and not gives_check
+                and 0 < victim < attacker
+                and board.is_attacked_by(opponent, move.to_square)
+            ):
                 continue  # loses material on the recapture: skip
             board.push(move)
             score = -self._quiescence(board, -beta, -alpha, qdepth + 1, None)
