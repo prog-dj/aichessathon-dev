@@ -902,8 +902,8 @@ MATE = 30000
 MATE_IN_MAX = MATE - 512
 INF = MATE + 1
 
-_PASS_MG = np.array([0, 5, 10, 15, 30, 55, 90, 0], np.int64)
-_PASS_EG = np.array([0, 10, 18, 30, 55, 95, 160, 0], np.int64)
+_PASS_MG = np.array([0, 6, 12, 17, 35, 63, 104, 0], np.int64)  # Texel x1.15
+_PASS_EG = np.array([0, 12, 21, 35, 63, 109, 184, 0], np.int64)
 
 
 @njit(cache=False)
@@ -943,7 +943,7 @@ def evaluate(bb, mb):
                     else:
                         att = queen_attacks(sq, occ)
                     att &= ~own
-                    mob[col] += 2 * popcount(att)
+                    mob[col] += 22 * popcount(att) // 10  # 2.2, Texel
                     rh = popcount(att & ring)
                     if rh > 0:
                         w = 2 if pt <= 2 else (3 if pt == 3 else 5)
@@ -994,7 +994,7 @@ def evaluate(bb, mb):
 @njit(cache=False, inline="always")
 def _king_danger(units):
     u = units if units < 40 else 40
-    return (u * u * 3) // 8
+    return (u * u * 11) // 16  # ~0.69, Texel wanted ~1.4 but that risks overreaction
 
 
 # --- search -------------------------------------------------------------------
