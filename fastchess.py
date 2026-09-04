@@ -1000,19 +1000,23 @@ def _king_danger(units):
 
 
 # --- NNUE ------------------------------------------------------------------
-# A small feature-transformer net: 768 (piece/colour/square, "own vs their"
-# from each perspective) -> 256 accumulator (shared weights, one pass per
-# perspective) -> concat 512 -> 16 -> 1. Trained offline (see
-# scratchpad/train_nnue.py in dev) on Lichess Stockfish-eval positions and
-# shipped as weights/nnue.npz - not a binary, same category as the .onnx/.pt
-# the rules explicitly allow. Recomputed from scratch each call (no
-# incremental accumulator yet); still cheap since only occupied squares cost
-# anything.
+# A king-relative (HalfKA-style) feature-transformer net: 49152 features
+# (own-king-square, piece/colour/square, "own vs their" from each
+# perspective) -> 256 accumulator (shared weights, one pass per perspective)
+# -> concat 512 -> 16 -> 1. Trained offline (see scratchpad/train_nnue.py in
+# dev) on Lichess Stockfish-eval positions and shipped as weights/nnue.npz -
+# not a binary, same category as the .onnx/.pt the rules explicitly allow.
+# Bucketing every feature by that perspective's own king square is what lets
+# the net learn king-relative patterns (shelter, an outpost near the king,
+# an open file toward it) at all - a flat piece-square table structurally
+# cannot represent that. The cost: every feature index for a perspective
+# depends on where that side's king is, so a king move invalidates the
+# whole perspective's accumulator - see _rebuild_one below.
 _NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
 NNUE_OK = False
 try:
     _nz = np.load(_NNUE_PATH)
-    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.float32)  # [768,256]
+    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.float32)  # [49152,256]
     NNUE_B_FT = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)  # [256]
     NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,16]
     NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [16]
@@ -1021,7 +1025,7 @@ try:
     NNUE_SCALE = float(_nz["scale"])
     NNUE_OK = True
 except Exception:
-    NNUE_W_FT = np.zeros((768, 256), np.float32)
+    NNUE_W_FT = np.zeros((49152, 256), np.float32)
     NNUE_B_FT = np.zeros(256, np.float32)
     NNUE_W_L1 = np.zeros((512, 16), np.float32)
     NNUE_B_L1 = np.zeros(16, np.float32)
@@ -1031,50 +1035,52 @@ except Exception:
 
 
 @njit(cache=False, inline="always")
-def _ft_feature(code, sq, persp):
-    """768-wide feature index for one piece from perspective `persp` (0/1)."""
+def _ft_feature(code, sq, persp, king_sq_persp):
+    """49152-wide feature index for one piece from perspective `persp`
+    (0/1), bucketed by that perspective's own king square (already
+    perspective-relative, i.e. pre-flipped for persp==1 same as any
+    other square)."""
     pt = code % 6
     colour = code // 6
     own = 1 if colour == persp else 0
     sq_rel = sq if persp == 0 else (sq ^ 56)
-    return (pt * 2 + (1 - own)) * 64 + sq_rel
+    flat = (pt * 2 + (1 - own)) * 64 + sq_rel
+    return king_sq_persp * 768 + flat
+
+
+@njit(cache=False, inline="always")
+def _rebuild_one(mb, acc, persp, king_sq_persp):
+    """Full O(pieces) rebuild of a single perspective's accumulator. Needed
+    whenever that perspective's own king moves, since every feature index
+    for it is bucketed by king square - an incremental diff can't fix that,
+    the whole accumulator is stale."""
+    acc[:] = NNUE_B_FT
+    for sq in range(64):
+        code = mb[sq]
+        if code < 0:
+            continue
+        acc += NNUE_W_FT[_ft_feature(code, sq, persp, king_sq_persp)]
 
 
 @njit(cache=False)
 def build_acc(bb, mb, acc_w, acc_b):
     """(Re)build both perspective accumulators from scratch. O(pieces) - call
     once per search, not per node."""
-    acc_w[:] = NNUE_B_FT
-    acc_b[:] = NNUE_B_FT
-    for sq in range(64):
-        code = mb[sq]
-        if code < 0:
-            continue
-        acc_w += NNUE_W_FT[_ft_feature(code, sq, 0)]
-        acc_b += NNUE_W_FT[_ft_feature(code, sq, 1)]
+    kw = lsb(bb[5] & bb[WOCC])
+    kb = lsb(bb[5] & bb[BOCC]) ^ 56
+    _rebuild_one(mb, acc_w, 0, kw)
+    _rebuild_one(mb, acc_b, 1, kb)
 
 
 @njit(cache=False, inline="always")
-def _acc_add(acc_w, acc_b, code, sq):
-    acc_w += NNUE_W_FT[_ft_feature(code, sq, 0)]
-    acc_b += NNUE_W_FT[_ft_feature(code, sq, 1)]
-
-
-@njit(cache=False, inline="always")
-def _acc_sub(acc_w, acc_b, code, sq):
-    acc_w -= NNUE_W_FT[_ft_feature(code, sq, 0)]
-    acc_b -= NNUE_W_FT[_ft_feature(code, sq, 1)]
-
-
-@njit(cache=False, inline="always")
-def _apply_diff(mb, sq, before, acc_w, acc_b):
+def _apply_diff_one(mb, sq, before, acc, persp, king_sq_persp):
     after = mb[sq]
     if after == before:
         return
     if before >= 0:
-        _acc_sub(acc_w, acc_b, before, sq)
+        acc -= NNUE_W_FT[_ft_feature(before, sq, persp, king_sq_persp)]
     if after >= 0:
-        _acc_add(acc_w, acc_b, after, sq)
+        acc += NNUE_W_FT[_ft_feature(after, sq, persp, king_sq_persp)]
 
 
 @njit(cache=False)
@@ -1098,12 +1104,30 @@ def make_move_acc(bb, mb, gh, ply, m, acc_w, acc_b):
     b3 = mb[sq3] if n >= 4 else -1
     make_move(bb, mb, gh, ply, m)
     if USE_NNUE:
-        _apply_diff(mb, frm, b0, acc_w, acc_b)
-        _apply_diff(mb, to, b1, acc_w, acc_b)
-        if n >= 3:
-            _apply_diff(mb, sq2, b2, acc_w, acc_b)
-        if n >= 4:
-            _apply_diff(mb, sq3, b3, acc_w, acc_b)
+        # a king move (incl. castling, where b0 is still the king at frm)
+        # invalidates every feature index for that perspective - rebuild
+        # rather than diff. The other perspective's king didn't move, so it
+        # can still be diffed with its (unchanged) king square.
+        kw = lsb(bb[5] & bb[WOCC])
+        if b0 == 5:
+            _rebuild_one(mb, acc_w, 0, kw)
+        else:
+            _apply_diff_one(mb, frm, b0, acc_w, 0, kw)
+            _apply_diff_one(mb, to, b1, acc_w, 0, kw)
+            if n >= 3:
+                _apply_diff_one(mb, sq2, b2, acc_w, 0, kw)
+            if n >= 4:
+                _apply_diff_one(mb, sq3, b3, acc_w, 0, kw)
+        kb = lsb(bb[5] & bb[BOCC]) ^ 56
+        if b0 == 11:
+            _rebuild_one(mb, acc_b, 1, kb)
+        else:
+            _apply_diff_one(mb, frm, b0, acc_b, 1, kb)
+            _apply_diff_one(mb, to, b1, acc_b, 1, kb)
+            if n >= 3:
+                _apply_diff_one(mb, sq2, b2, acc_b, 1, kb)
+            if n >= 4:
+                _apply_diff_one(mb, sq3, b3, acc_b, 1, kb)
 
 
 @njit(cache=False)
@@ -1122,14 +1146,33 @@ def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
     b0, b1 = mb[frm], mb[to]
     b2 = mb[sq2] if n >= 3 else -1
     b3 = mb[sq3] if n >= 4 else -1
+    # b1 (the piece currently sitting at `to`, i.e. post-move/pre-unmake) is
+    # the king itself when this move was a king move - mirrors the b0==5/11
+    # check in make_move_acc, just read on the other side of the mutation.
+    white_king_moved = (b1 == 5)
+    black_king_moved = (b1 == 11)
     unmake_move(bb, mb, gh, ply)
     if USE_NNUE:
-        _apply_diff(mb, frm, b0, acc_w, acc_b)
-        _apply_diff(mb, to, b1, acc_w, acc_b)
-        if n >= 3:
-            _apply_diff(mb, sq2, b2, acc_w, acc_b)
-        if n >= 4:
-            _apply_diff(mb, sq3, b3, acc_w, acc_b)
+        kw = lsb(bb[5] & bb[WOCC])
+        if white_king_moved:
+            _rebuild_one(mb, acc_w, 0, kw)
+        else:
+            _apply_diff_one(mb, frm, b0, acc_w, 0, kw)
+            _apply_diff_one(mb, to, b1, acc_w, 0, kw)
+            if n >= 3:
+                _apply_diff_one(mb, sq2, b2, acc_w, 0, kw)
+            if n >= 4:
+                _apply_diff_one(mb, sq3, b3, acc_w, 0, kw)
+        kb = lsb(bb[5] & bb[BOCC]) ^ 56
+        if black_king_moved:
+            _rebuild_one(mb, acc_b, 1, kb)
+        else:
+            _apply_diff_one(mb, frm, b0, acc_b, 1, kb)
+            _apply_diff_one(mb, to, b1, acc_b, 1, kb)
+            if n >= 3:
+                _apply_diff_one(mb, sq2, b2, acc_b, 1, kb)
+            if n >= 4:
+                _apply_diff_one(mb, sq3, b3, acc_b, 1, kb)
 
 
 @njit(cache=False)

@@ -18,5 +18,6 @@ submission.zip
 /weights/*.onnx.data
 /weights/book.json
 /weights/syzygy/
+/weights/nnue.npz
 dist-wheels/
 games/
