@@ -25,7 +25,8 @@ extension-module = ["pyo3/extension-module"]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# keep unwind (not abort): a panic then surfaces as a Python exception and
+# agent.py falls back to its own engine instead of the process dying.
 
 [profile.test]
 opt-level = 3

@@ -311,7 +311,7 @@ impl Searcher {
                 }
             }
             if quiet {
-                quiets_tried.push(mv);
+                let _ = quiets_tried.try_push(mv); // full is fine: just fewer history maluses
             }
         }
 
@@ -456,7 +456,7 @@ impl Searcher {
 }
 
 use arrayvec::ArrayVec;
-type ArrayVec8 = ArrayVec<Move, 64>;
+type ArrayVec8 = ArrayVec<Move, 96>;
 
 #[inline]
 fn tt_score_to(s: i32, ply: i32) -> i32 {
