@@ -18,3 +18,4 @@ submission.zip
 /weights/*.onnx.data
 /weights/book.json
 /weights/syzygy/
+dist-wheels/

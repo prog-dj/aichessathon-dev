@@ -1,0 +1,3 @@
+# The Rust engine. Ships as an abi3 manylinux wheel on PyPI; agent.py falls back
+# to the pure-Python engine if this import fails.
+chessathon-engine==0.1.0
