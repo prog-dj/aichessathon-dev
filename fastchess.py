@@ -11,6 +11,8 @@ is missing or a JIT compile fails.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from numba import njit
 
@@ -907,7 +909,7 @@ _PASS_EG = np.array([0, 12, 21, 35, 63, 109, 184, 0], np.int64)
 
 
 @njit(cache=False)
-def evaluate(bb, mb):
+def evaluate_hce(bb, mb):
     occ = bb[OCC]
     ph = 0
     for pt in range(1, 5):
@@ -995,6 +997,194 @@ def evaluate(bb, mb):
 def _king_danger(units):
     u = units if units < 40 else 40
     return (u * u * 11) // 16  # ~0.69, Texel wanted ~1.4 but that risks overreaction
+
+
+# --- NNUE ------------------------------------------------------------------
+# A small feature-transformer net: 768 (piece/colour/square, "own vs their"
+# from each perspective) -> 256 accumulator (shared weights, one pass per
+# perspective) -> concat 512 -> 16 -> 1. Trained offline (see
+# scratchpad/train_nnue.py in dev) on Lichess Stockfish-eval positions and
+# shipped as weights/nnue.npz - not a binary, same category as the .onnx/.pt
+# the rules explicitly allow. Recomputed from scratch each call (no
+# incremental accumulator yet); still cheap since only occupied squares cost
+# anything.
+_NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
+NNUE_OK = False
+try:
+    _nz = np.load(_NNUE_PATH)
+    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.float32)  # [768,256]
+    NNUE_B_FT = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)  # [256]
+    NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,16]
+    NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [16]
+    NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [16]
+    NNUE_B_L2 = float(_nz["b_l2"])
+    NNUE_SCALE = float(_nz["scale"])
+    NNUE_OK = True
+except Exception:
+    NNUE_W_FT = np.zeros((768, 256), np.float32)
+    NNUE_B_FT = np.zeros(256, np.float32)
+    NNUE_W_L1 = np.zeros((512, 16), np.float32)
+    NNUE_B_L1 = np.zeros(16, np.float32)
+    NNUE_W_L2 = np.zeros(16, np.float32)
+    NNUE_B_L2 = 0.0
+    NNUE_SCALE = 100.0
+
+
+@njit(cache=False, inline="always")
+def _ft_feature(code, sq, persp):
+    """768-wide feature index for one piece from perspective `persp` (0/1)."""
+    pt = code % 6
+    colour = code // 6
+    own = 1 if colour == persp else 0
+    sq_rel = sq if persp == 0 else (sq ^ 56)
+    return (pt * 2 + (1 - own)) * 64 + sq_rel
+
+
+@njit(cache=False)
+def build_acc(bb, mb, acc_w, acc_b):
+    """(Re)build both perspective accumulators from scratch. O(pieces) - call
+    once per search, not per node."""
+    acc_w[:] = NNUE_B_FT
+    acc_b[:] = NNUE_B_FT
+    for sq in range(64):
+        code = mb[sq]
+        if code < 0:
+            continue
+        acc_w += NNUE_W_FT[_ft_feature(code, sq, 0)]
+        acc_b += NNUE_W_FT[_ft_feature(code, sq, 1)]
+
+
+@njit(cache=False, inline="always")
+def _acc_add(acc_w, acc_b, code, sq):
+    acc_w += NNUE_W_FT[_ft_feature(code, sq, 0)]
+    acc_b += NNUE_W_FT[_ft_feature(code, sq, 1)]
+
+
+@njit(cache=False, inline="always")
+def _acc_sub(acc_w, acc_b, code, sq):
+    acc_w -= NNUE_W_FT[_ft_feature(code, sq, 0)]
+    acc_b -= NNUE_W_FT[_ft_feature(code, sq, 1)]
+
+
+@njit(cache=False, inline="always")
+def _apply_diff(mb, sq, before, acc_w, acc_b):
+    after = mb[sq]
+    if after == before:
+        return
+    if before >= 0:
+        _acc_sub(acc_w, acc_b, before, sq)
+    if after >= 0:
+        _acc_add(acc_w, acc_b, after, sq)
+
+
+@njit(cache=False)
+def make_move_acc(bb, mb, gh, ply, m, acc_w, acc_b):
+    """make_move, keeping the NNUE accumulators in sync by diffing the up-to-4
+    squares a move can touch (from/to, +rook for castling, +capture square
+    for en passant) before and after - no duplicated move-application logic,
+    so it cannot desync from what make_move actually did."""
+    frm, to, flag = m_from(m), m_to(m), m_flag(m)
+    us = I(bb[STM])
+    sq2, sq3, n = -1, -1, 2
+    if flag == EP_FLAG:
+        sq2 = to - 8 if us == 0 else to + 8
+        n = 3
+    elif flag == CK:
+        sq2, sq3, n = to + 1, to - 1, 4
+    elif flag == CQ:
+        sq2, sq3, n = to - 2, to + 1, 4
+    b0, b1 = mb[frm], mb[to]
+    b2 = mb[sq2] if n >= 3 else -1
+    b3 = mb[sq3] if n >= 4 else -1
+    make_move(bb, mb, gh, ply, m)
+    if USE_NNUE:
+        _apply_diff(mb, frm, b0, acc_w, acc_b)
+        _apply_diff(mb, to, b1, acc_w, acc_b)
+        if n >= 3:
+            _apply_diff(mb, sq2, b2, acc_w, acc_b)
+        if n >= 4:
+            _apply_diff(mb, sq3, b3, acc_w, acc_b)
+
+
+@njit(cache=False)
+def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
+    m = np.int32(gh[ply, 0])
+    frm, to, flag = m_from(m), m_to(m), m_flag(m)
+    us = 1 - I(bb[STM])  # bb[STM] is currently the mover's opponent
+    sq2, sq3, n = -1, -1, 2
+    if flag == EP_FLAG:
+        sq2 = to - 8 if us == 0 else to + 8
+        n = 3
+    elif flag == CK:
+        sq2, sq3, n = to + 1, to - 1, 4
+    elif flag == CQ:
+        sq2, sq3, n = to - 2, to + 1, 4
+    b0, b1 = mb[frm], mb[to]
+    b2 = mb[sq2] if n >= 3 else -1
+    b3 = mb[sq3] if n >= 4 else -1
+    unmake_move(bb, mb, gh, ply)
+    if USE_NNUE:
+        _apply_diff(mb, frm, b0, acc_w, acc_b)
+        _apply_diff(mb, to, b1, acc_w, acc_b)
+        if n >= 3:
+            _apply_diff(mb, sq2, b2, acc_w, acc_b)
+        if n >= 4:
+            _apply_diff(mb, sq3, b3, acc_w, acc_b)
+
+
+@njit(cache=False)
+def nnue_eval(bb, mb):
+    """Full recompute from scratch - reference implementation, used to (re)seed
+    the incremental accumulators and to cross-check them in tests."""
+    acc_w = NNUE_B_FT.copy()
+    acc_b = NNUE_B_FT.copy()
+    build_acc(bb, mb, acc_w, acc_b)
+    return nnue_from_acc(bb, acc_w, acc_b)
+
+
+@njit(cache=False)
+def nnue_from_acc(bb, acc_w, acc_b):
+    """Forward pass from already-maintained accumulators - no board walk.
+    Explicit scalar loops (no numpy row slicing/broadcasting in the hot path -
+    that was allocating a temporary 16-wide array on every one of the 256
+    iterations and cost 23x a whole HCE eval)."""
+    stm = I(bb[STM])
+    a_stm = acc_w if stm == 0 else acc_b
+    a_opp = acc_b if stm == 0 else acc_w
+
+    h = np.empty(16, np.float32)
+    for k in range(16):
+        h[k] = NNUE_B_L1[k]
+    # relu(a)[i] == a[i] when a[i] > 0, else contributes nothing - skip the
+    # separate np.maximum pass and just gate on the raw accumulator.
+    for i in range(256):
+        s = a_stm[i]
+        if s > 0.0:
+            for k in range(16):
+                h[k] += s * NNUE_W_L1[i, k]
+    for i in range(256):
+        o = a_opp[i]
+        if o > 0.0:
+            for k in range(16):
+                h[k] += o * NNUE_W_L1[256 + i, k]
+    out = NNUE_B_L2
+    for i in range(16):
+        v = h[i]
+        if v > 0.0:
+            out += v * NNUE_W_L2[i]
+    return I(out * NNUE_SCALE) + 14
+
+
+# FASTCHESS_NNUE=1 switches the search onto the net for A/B testing; baked in
+# at import (numba freezes plain globals as compile-time constants).
+USE_NNUE = NNUE_OK and os.environ.get("FASTCHESS_NNUE", "0") == "1"
+
+
+@njit(cache=False)
+def evaluate(bb, mb, acc_w, acc_b):
+    if USE_NNUE:
+        return nnue_from_acc(bb, acc_w, acc_b)
+    return evaluate_hce(bb, mb)
 
 
 # --- search -------------------------------------------------------------------
@@ -1094,14 +1284,14 @@ def _order(bb, mb, kl, hi, buf, n, ply, tt_move):
 
 
 @njit(cache=False)
-def _qs(bb, mb, tt, gh, kl, hi, mv, ct, ply, alpha, beta):
+def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     ct[N_NODES] += 1
     if ct[N_NODES] >= ct[N_MAXN]:
         ct[N_STOP] = 1
         return 0
     checked = in_check(bb, mb)
     if not checked:
-        stand = evaluate(bb, mb)
+        stand = evaluate(bb, mb, acc_w, acc_b)
         if stand >= beta:
             return stand
         if stand > alpha:
@@ -1109,7 +1299,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, ply, alpha, beta):
     else:
         stand = -INF_S
     if ply >= MAX_PLY - 1:
-        return stand if not checked else evaluate(bb, mb)
+        return stand if not checked else evaluate(bb, mb, acc_w, acc_b)
 
     buf = mv[ply]
     n = gen_moves(bb, mb, buf, not checked)
@@ -1127,9 +1317,9 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, ply, alpha, beta):
             attacker = MG_VAL[mb[m_from(m)] % 6]
             if victim + 90 < attacker and stand + victim + 150 < alpha:
                 continue
-        make_move(bb, mb, gh, gp + ply, m)
-        s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, ply + 1, -beta, -alpha)
-        unmake_move(bb, mb, gh, gp + ply)
+        make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
+        s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
+        unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
         if ct[N_STOP] == 1:
             return 0
         if s > best:
@@ -1142,7 +1332,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, ply, alpha, beta):
 
 
 @njit(cache=False)
-def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
+def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, is_pv):
     if ct[N_STOP] == 1:
         return 0
     ct[N_NODES] += 1
@@ -1155,7 +1345,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
     if ply > 0 and _rep_or_50(bb, gh, ct, ply):
         return 0
     if ply >= MAX_PLY - 1:
-        return evaluate(bb, mb)
+        return evaluate(bb, mb, acc_w, acc_b)
 
     if alpha < -MATE_S + ply:
         alpha = -MATE_S + ply
@@ -1168,7 +1358,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
     if checked:
         depth += 1
     if depth <= 0:
-        return _qs(bb, mb, tt, gh, kl, hi, mv, ct, ply, alpha, beta)
+        return _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta)
 
     tt_move = np.int32(0)
     ti = _tt_get(tt, bb[KEY])
@@ -1189,7 +1379,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
             if fl == 3 and s <= alpha:
                 return s
 
-    static = -INF_S if checked else evaluate(bb, mb)
+    static = -INF_S if checked else evaluate(bb, mb, acc_w, acc_b)
 
     can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
     if can_rfp and static - 80 * depth >= beta:
@@ -1198,7 +1388,8 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
     if (not is_pv) and (not checked) and depth >= 3 and static >= beta and _has_np(bb, I(bb[STM])):
         r = 3 + depth // 4
         make_null(bb, gh, ct[N_GPLY] + ply)
-        s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, depth - r, ply + 1, -beta, -beta + 1, False)
+        s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                      depth - r, ply + 1, -beta, -beta + 1, False)
         unmake_null(bb, gh, ct[N_GPLY] + ply)
         if s >= beta and abs(s) < MIMAX:
             return beta
@@ -1227,11 +1418,12 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
             if depth <= 3 and static + 90 * depth <= alpha and i > 0:
                 continue
 
-        make_move(bb, mb, gh, gp + ply, m)
+        make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
         gives_check = in_check(bb, mb)
         nd = depth - 1
         if i == 0:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, nd, ply + 1, -beta, -alpha, is_pv)
+            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                          nd, ply + 1, -beta, -alpha, is_pv)
         else:
             r = 0
             if depth >= 3 and quiet and (not gives_check) and (not checked):
@@ -1242,12 +1434,15 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
                     r = 0
                 if r > nd - 1:
                     r = nd - 1
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, nd - r, ply + 1, -alpha - 1, -alpha, False)
+            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                          nd - r, ply + 1, -alpha - 1, -alpha, False)
             if s > alpha and r > 0:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, nd, ply + 1, -alpha - 1, -alpha, False)
+                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                              nd, ply + 1, -alpha - 1, -alpha, False)
             if s > alpha and s < beta:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, nd, ply + 1, -beta, -alpha, True)
-        unmake_move(bb, mb, gh, gp + ply)
+                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                              nd, ply + 1, -beta, -alpha, True)
+        unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
 
         if ct[N_STOP] == 1:
             return 0
@@ -1287,7 +1482,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, depth, ply, alpha, beta, is_pv):
 
 
 @njit(cache=False)
-def _root(bb, mb, tt, gh, kl, hi, mv, ct, depth, alpha, beta):
+def _root(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, alpha, beta):
     buf = mv[0]
     n = gen_moves(bb, mb, buf, False)
     tt_move = np.int32(0)
@@ -1302,14 +1497,17 @@ def _root(bb, mb, tt, gh, kl, hi, mv, ct, depth, alpha, beta):
     gp = ct[N_GPLY]
     for i in range(n):
         m = buf[i]
-        make_move(bb, mb, gh, gp, m)
+        make_move_acc(bb, mb, gh, gp, m, acc_w, acc_b)
         if i == 0:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, depth - 1, 1, -beta, -a, True)
+            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                          depth - 1, 1, -beta, -a, True)
         else:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, depth - 1, 1, -a - 1, -a, False)
+            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                          depth - 1, 1, -a - 1, -a, False)
             if s > a and s < beta:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, depth - 1, 1, -beta, -a, True)
-        unmake_move(bb, mb, gh, gp)
+                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                              depth - 1, 1, -beta, -a, True)
+        unmake_move_acc(bb, mb, gh, gp, acc_w, acc_b)
         if ct[N_STOP] == 1:
             break
         if s > best:
@@ -1337,11 +1535,15 @@ class Engine:
         self.hi = np.zeros((2, 64, 64), np.int32)
         self.mv = np.zeros((MAX_PLY, 256), np.int32)
         self.ct = np.zeros(8, np.int64)
+        self.acc_w = np.zeros(256, np.float32)
+        self.acc_b = np.zeros(256, np.float32)
         # warm the JIT (compiles the whole graph)
         bb, mb = fen_to_arrays("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+        build_acc(bb, mb, self.acc_w, self.acc_b)
         self.ct[N_MAXN] = 30_000
         self.ct[:] = [0, 0, 30_000, 0, 0, 0, 0, 0]
-        _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.mv, self.ct, 4, -INF, INF)
+        _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.mv, self.ct,
+              self.acc_w, self.acc_b, 4, -INF, INF)
         self.clear()
 
     def clear(self):
@@ -1352,6 +1554,7 @@ class Engine:
 
         bb, mb = fen_to_arrays(fen)
         gp = _seed_history(bb, mb, list(moves), self.gh)
+        build_acc(bb, mb, self.acc_w, self.acc_b)  # O(pieces), once per move
         self.kl[:, :] = 0
         self.hi[:, :, :] = 0
         self.ct[:] = 0
@@ -1372,7 +1575,8 @@ class Engine:
                 window = 30
                 while True:
                     mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
-                                    self.mv, self.ct, depth, score - window, score + window)
+                                    self.mv, self.ct, self.acc_w, self.acc_b,
+                                    depth, score - window, score + window)
                     if self.ct[N_STOP] == 1:
                         break
                     if sc <= score - window or sc >= score + window:
@@ -1381,7 +1585,8 @@ class Engine:
                         break
             else:
                 mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
-                                self.mv, self.ct, depth, -INF, INF)
+                                self.mv, self.ct, self.acc_w, self.acc_b,
+                                depth, -INF, INF)
 
             elapsed = time.perf_counter() - start
             if self.ct[N_STOP] == 1 and best is not None:
