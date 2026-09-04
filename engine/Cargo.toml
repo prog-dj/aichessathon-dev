@@ -1,0 +1,31 @@
+[package]
+name = "chessathon-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Bitboard chess move generation, search and evaluation for the AI Chessathon agent"
+license = "MIT"
+repository = "https://github.com/prog-dj/aichessathon-dev"
+
+[lib]
+name = "chessathon_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", default-features = false, features = ["abi3-py312", "macros"] }
+arrayvec = "0.7"
+
+[features]
+default = []
+# maturin turns this on; it stops pyo3 linking libpython so the wheel loads
+# against the host interpreter. `cargo test` runs without it.
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.test]
+opt-level = 3

@@ -1,0 +1,73 @@
+name: engine wheels
+
+on:
+  push:
+    tags: ["engine-v*"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: engine
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist --manylinux 2014
+          working-directory: engine
+      - name: perft
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import chessathon_engine as e; e.init(); assert e.perft('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',5)==4865609; print(e.version())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux
+          path: engine/dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          working-directory: engine
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows
+          path: engine/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: engine
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: engine/dist
+
+  publish:
+    needs: [linux, windows, sdist]
+    if: startsWith(github.ref, 'refs/tags/engine-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

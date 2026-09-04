@@ -36,7 +36,7 @@ files = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["chess.*", "onnxruntime.*"]
+module = ["chess.*", "onnxruntime.*", "chessathon_engine.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
