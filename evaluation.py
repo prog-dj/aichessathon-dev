@@ -156,6 +156,11 @@ _PASSED_BONUS = (0, 8, 12, 22, 40, 66, 100, 0)  # by rank of the pawn (0..7)
 _ROOK_OPEN = 22
 _ROOK_HALF_OPEN = 10
 _KING_SHIELD = 12  # per pawn in front of a castled king
+_MOBILITY = 2
+_CENTER_CONTROL = 5
+_MINOR_ACTIVITY = 18
+_KING_PRESSURE = 6
+_QUEEN_INITIATIVE = 12
 
 
 _MATE_THRESHOLD = 450  # once this far ahead, start driving the bare king to a corner
@@ -234,7 +239,7 @@ def mpst_quiet_delta(board: chess.Board, move: chess.Move) -> float | None:
 
 
 def _positional(board: chess.Board) -> int:
-    """Passed pawns, rooks on open files, king pawn shield - all White's point of view."""
+    """Activity, king safety, and pawn structure terms from White's point of view."""
     white_pawns = board.pawns & board.occupied_co[chess.WHITE]
     black_pawns = board.pawns & board.occupied_co[chess.BLACK]
     score = 0
@@ -263,8 +268,56 @@ def _positional(board: chess.Board) -> int:
         elif not file_bb & black_pawns:
             score -= _ROOK_HALF_OPEN
 
+    score += _activity(board)
+    score += _king_pressure(board)
     score += _king_shield(board.king(chess.WHITE), white_pawns, True)
     score -= _king_shield(board.king(chess.BLACK), black_pawns, False)
+    return score
+
+
+def _activity(board: chess.Board) -> int:
+    """Reward useful mobility, central control, and coordinated minor pieces."""
+    center = chess.BB_D4 | chess.BB_E4 | chess.BB_D5 | chess.BB_E5
+    score = 0
+    for color, sign in ((chess.WHITE, 1), (chess.BLACK, -1)):
+        mobility = 0
+        center_control = 0
+        active_minors = 0
+        for square, piece in board.piece_map().items():
+            if piece.color != color:
+                continue
+            attacks = board.attacks(square).mask
+            mobility += chess.popcount(attacks & ~board.occupied_co[color])
+            center_control += chess.popcount(attacks & center)
+            if piece.piece_type in (chess.KNIGHT, chess.BISHOP) and attacks & center:
+                active_minors += 1
+        score += sign * (
+            _MOBILITY * mobility
+            + _CENTER_CONTROL * center_control
+            + _MINOR_ACTIVITY * max(0, active_minors - 1)
+        )
+    return score
+
+
+def _king_pressure(board: chess.Board) -> int:
+    """Reward attacks near an exposed enemy king, especially while queens remain."""
+    white_king, black_king = board.king(chess.WHITE), board.king(chess.BLACK)
+    if white_king is None or black_king is None:
+        return 0
+
+    def pressure(attacker: chess.Color, king: int) -> int:
+        zone = board.attacks(king).mask | chess.BB_SQUARES[king]
+        attacked = sum(
+            chess.popcount(board.attackers(attacker, square).mask)
+            for square in chess.scan_forward(zone)
+        )
+        return attacked
+
+    white = pressure(chess.WHITE, black_king)
+    black = pressure(chess.BLACK, white_king)
+    score = _KING_PRESSURE * (white - black)
+    if board.queens:
+        score += _QUEEN_INITIATIVE * (white - black)
     return score
 
 
