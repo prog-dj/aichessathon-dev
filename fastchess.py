@@ -921,14 +921,6 @@ def evaluate_hce(bb, mb):
     eg = 0
     mob = np.zeros(2, np.int64)
     danger = np.zeros(2, np.int64)
-    # aggregate "what does colour X attack" bitboards, built alongside the
-    # existing per-piece loop, used below for weak-square and safe-check
-    # detection - the actual king-safety signal, not just a ring-attack count.
-    atk_all = np.zeros(2, np.uint64)
-    atk_diag = np.zeros(2, np.uint64)   # bishops + queens
-    atk_orth = np.zeros(2, np.uint64)   # rooks + queens
-    atk_knight = np.zeros(2, np.uint64)
-    ksq = np.zeros(2, np.int64)
 
     for col in range(2):
         sign = 1 if col == 0 else -1
@@ -936,37 +928,25 @@ def evaluate_hce(bb, mb):
         ksq_them = lsb(bb[5] & bb[6 + them])
         ring = KING_ATT[ksq_them] | (ONE << U(ksq_them))
         own = bb[6 + col]
-        pw = bb[0] & own
-        while pw != U(0):
-            psq = lsb(pw); pw &= pw - ONE
-            atk_all[col] |= PAWN_ATT[col][psq]
         for pt in range(6):
             x = bb[pt] & own
             while x != U(0):
                 sq = lsb(x); x &= x - ONE
-                if pt == 5:
-                    ksq[col] = sq
                 idx = sq if col == 0 else (sq ^ 56)
                 mg += sign * (MG_VAL[pt] + _MG_PST[pt, idx])
                 eg += sign * (EG_VAL[pt] + _EG_PST[pt, idx])
                 if 1 <= pt <= 4:
                     if pt == 1:
                         att = KNIGHT_ATT[sq]
-                        atk_knight[col] |= att
                     elif pt == 2:
                         att = bishop_attacks(sq, occ)
-                        atk_diag[col] |= att
                     elif pt == 3:
                         att = rook_attacks(sq, occ)
-                        atk_orth[col] |= att
                     else:
                         att = queen_attacks(sq, occ)
-                        atk_diag[col] |= att
-                        atk_orth[col] |= att
-                    atk_all[col] |= att
-                    reach = att & ~own
-                    mob[col] += 22 * popcount(reach) // 10  # 2.2, Texel
-                    rh = popcount(reach & ring)
+                    att &= ~own
+                    mob[col] += 22 * popcount(att) // 10  # 2.2, Texel
+                    rh = popcount(att & ring)
                     if rh > 0:
                         w = 2 if pt <= 2 else (3 if pt == 3 else 5)
                         danger[them] += w * rh
@@ -1000,25 +980,6 @@ def evaluate_hce(bb, mb):
                 mg += sign * 22
             elif (fmask & own_p) == U(0):
                 mg += sign * 10
-
-    # weak squares (in the king ring, attacked by the enemy, undefended) and
-    # safe checks (a square that gives check, reachable by an attacker, not
-    # itself defended) - the actual signal that separates a real attack from
-    # a piece merely eyeing the king's neighbourhood.
-    for col in range(2):
-        them = 1 - col
-        kt = ksq[them]
-        ring = KING_ATT[kt] | (ONE << U(kt))
-        weak = ring & atk_all[col] & ~atk_all[them]
-        not_own = ~bb[6 + col]
-        chk_n = KNIGHT_ATT[kt]
-        chk_d = bishop_attacks(kt, occ)
-        chk_o = rook_attacks(kt, occ)
-        safe_n = chk_n & atk_knight[col] & not_own & ~atk_all[them]
-        safe_d = chk_d & atk_diag[col] & not_own & ~atk_all[them]
-        safe_o = chk_o & atk_orth[col] & not_own & ~atk_all[them]
-        n_safe = popcount(safe_n) + popcount(safe_d) + popcount(safe_o)
-        danger[them] += 6 * popcount(weak) + 16 * n_safe
 
     wd = _king_danger(danger[0])
     bd = _king_danger(danger[1])
