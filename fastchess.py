@@ -374,6 +374,31 @@ BK_SAFE = (ONE << U(60)) | BK_PATH
 BQ_SAFE = (ONE << U(60)) | (ONE << U(59)) | (ONE << U(58))
 FILE_BB = np.array([FILE_A << U(f) for f in range(8)], np.uint64)
 RANK_BB = np.array([RANK_1 << U(8 * r) for r in range(8)], np.uint64)
+ADJ_FILES = np.array(
+    [((int(FILE_BB[f - 1]) if f > 0 else 0) | (int(FILE_BB[f + 1]) if f < 7 else 0))
+     for f in range(8)],
+    np.uint64,
+)
+
+
+def _passed_masks():
+    w = np.zeros(64, np.uint64)
+    b = np.zeros(64, np.uint64)
+    for sq in range(64):
+        f, r = sq & 7, sq >> 3
+        span = int(FILE_BB[f]) | int(ADJ_FILES[f])
+        ahead_w = 0
+        for rr in range(r + 1, 8):
+            ahead_w |= int(RANK_BB[rr])
+        ahead_b = 0
+        for rr in range(r):
+            ahead_b |= int(RANK_BB[rr])
+        w[sq] = span & ahead_w
+        b[sq] = span & ahead_b
+    return w, b
+
+
+PASSED_W, PASSED_B = _passed_masks()
 
 
 @njit(cache=False, inline="always")
@@ -935,27 +960,13 @@ def evaluate(bb, mb):
             sq = lsb(pp); pp &= pp - ONE
             f = sq & 7
             fmask = FILE_BB[f]
-            adj = U(0)
-            if f > 0:
-                adj |= FILE_BB[f - 1]
-            if f < 7:
-                adj |= FILE_BB[f + 1]
-            if (own_p & adj) == U(0):
+            if (own_p & ADJ_FILES[f]) == U(0):
                 mg -= sign * 12; eg -= sign * 12
             if popcount(own_p & fmask) > 1:
                 mg -= sign * 5; eg -= sign * 10
-            r = sq >> 3
-            if col == 0:
-                front = U(0)
-                for rr in range(r + 1, 8):
-                    front |= RANK_BB[rr]
-                rr_idx = r
-            else:
-                front = U(0)
-                for rr in range(0, r):
-                    front |= RANK_BB[rr]
-                rr_idx = 7 - r
-            if ((fmask | adj) & front & enemy_p) == U(0):
+            span = PASSED_W[sq] if col == 0 else PASSED_B[sq]
+            if (span & enemy_p) == U(0):
+                rr_idx = (sq >> 3) if col == 0 else (7 - (sq >> 3))
                 mg += sign * _PASS_MG[rr_idx]
                 eg += sign * _PASS_EG[rr_idx]
         # rooks open files
@@ -973,7 +984,9 @@ def evaluate(bb, mb):
     mg += bd - wd
     mg += mob[0] - mob[1]
 
-    score = (mg * ph + eg * (PHASE_MAX - ph)) // PHASE_MAX
+    # truncate toward zero so the tapered score is exactly colour-symmetric
+    num = mg * ph + eg * (PHASE_MAX - ph)
+    score = num // PHASE_MAX if num >= 0 else -((-num) // PHASE_MAX)
     stm = score if I(bb[STM]) == 0 else -score
     return stm + 14
 
