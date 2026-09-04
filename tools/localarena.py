@@ -212,7 +212,15 @@ def main() -> None:
     if workers == 1:
         results = [_run_job(job) for job in jobs]
     else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        # max_tasks_per_child=1: load_agent() gives every game a fresh,
+        # uniquely-named module (so numba/TT state can't be shared between
+        # games on purpose), but that also means a worker that plays several
+        # games in a row never releases the previous game's Engine() - RSS
+        # climbs without bound until allocations start failing and the
+        # engine silently falls back to the much weaker Python fallback
+        # mid-run, corrupting the result. Recycling the process after every
+        # game costs a re-compile per game but keeps every game honest.
+        with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
             results = list(pool.map(_run_job, jobs))
 
     total_plies = 0
