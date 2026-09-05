@@ -11,10 +11,19 @@ is missing or a JIT compile fails.
 
 from __future__ import annotations
 
+import math
 import os
 
 import numpy as np
 from numba import njit
+
+# Late-move-reduction table: r = round(0.5 + ln(depth)*ln(movecount)/2.2).
+# Smooth log growth instead of the old 3-step ladder - reduces less at shallow
+# depth / early moves (where tactics live) and more in the deep tail.
+_LMR = np.zeros((64, 64), np.int64)
+for _d in range(1, 64):
+    for _m in range(1, 64):
+        _LMR[_d, _m] = int(0.5 + math.log(_d) * math.log(_m) / 2.2)
 
 U = np.uint64
 I = np.int64
@@ -1547,9 +1556,13 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
         else:
             r = 0
             if depth >= 3 and quiet and (not gives_check) and (not checked):
-                r = 1 + (1 if i >= 6 else 0) + (1 if (depth >= 6 and i >= 12) else 0)
+                dd = depth if depth < 64 else 63
+                mm = i if i < 64 else 63
+                r = _LMR[dd, mm]
                 if is_pv:
                     r -= 1
+                if hi[stm, m_from(m), m_to(m)] > 600:
+                    r -= 1                       # move with strong history: trust it more
                 if r < 0:
                     r = 0
                 if r > nd - 1:
