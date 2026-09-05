@@ -1413,10 +1413,30 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     if ct[N_NODES] >= ct[N_MAXN]:
         ct[N_STOP] = 1
         return 0
+
+    old_alpha = alpha
+    qtt_move = np.int32(0)
+    ti = _tt_get(tt, bb[KEY])
+    if ti >= 0:
+        qtt_move = np.int32(tt[ti, 1])
+        s = tt[ti, 2]
+        if s >= MIMAX:
+            s -= ply
+        elif s <= -MIMAX:
+            s += ply
+        fl = tt[ti, 3] & 3
+        if fl == 1:
+            return s
+        if fl == 2 and s >= beta:
+            return s
+        if fl == 3 and s <= alpha:
+            return s
+
     checked = in_check(bb, mb)
     if not checked:
         stand = evaluate(bb, mb, acc_w, acc_b)
         if stand >= beta:
+            _tt_put(tt, bb[KEY], np.int32(0), stand, 0, 2)
             return stand
         if stand > alpha:
             alpha = stand
@@ -1429,9 +1449,10 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     n = gen_moves(bb, mb, buf, not checked)
     if n == 0:
         return -MATE_S + ply if checked else stand
-    _order(bb, mb, kl, hi, buf, n, ply, 0)
+    _order(bb, mb, kl, hi, buf, n, ply, qtt_move)
 
     best = stand
+    best_m = np.int32(0)
     gp = ct[N_GPLY]
     for i in range(n):
         m = buf[i]
@@ -1453,10 +1474,19 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
             return 0
         if s > best:
             best = s
+            best_m = m
             if s > alpha:
                 alpha = s
                 if alpha >= beta:
                     break
+    if best > -MATE_S + ply + 1:      # don't cache raw mated-in-0 losses from cutoffs
+        fl = 2 if best >= beta else (1 if best > old_alpha else 3)
+        ss = best
+        if ss >= MIMAX:
+            ss += ply
+        elif ss <= -MIMAX:
+            ss -= ply
+        _tt_put(tt, bb[KEY], best_m, ss, 0, fl)
     return best
 
 
