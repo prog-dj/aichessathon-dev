@@ -341,6 +341,30 @@ def attack_map(bb, mb, by, occ):
     return a
 
 
+@njit(cache=False, inline="always")
+def _pawn_atk_mask(bb, by):
+    """All squares attacked by side `by`'s pawns only - same loop as the
+    pawn section of attack_map, exposed separately since threat detection
+    needs to tell 'attacked by a pawn' apart from 'attacked by anything'."""
+    a = U(0)
+    p = bb[0] & bb[6 + by]
+    while p != U(0):
+        s = lsb(p)
+        p &= p - ONE
+        a |= PAWN_ATT[by][s]
+    return a
+
+
+@njit(cache=False, inline="always")
+def _cheb(a, b):
+    """Chebyshev (king-move) distance between two squares."""
+    fa, ra = a & 7, a >> 3
+    fb, rb = b & 7, b >> 3
+    df = fa - fb if fa >= fb else fb - fa
+    dr = ra - rb if ra >= rb else rb - ra
+    return df if df > dr else dr
+
+
 @njit(cache=False)
 def pinned_pieces(bb, mb, ksq, us, occ):
     them = 1 - us
@@ -922,10 +946,25 @@ def evaluate_hce(bb, mb):
     mob = np.zeros(2, np.int64)
     danger = np.zeros(2, np.int64)
 
+    # computed once, shared by both colours below: full attack maps (for
+    # hanging-piece threats) and pawn-only attack maps (a piece attacked by
+    # a pawn is a threat worth flagging even when technically "defended",
+    # since the trade is usually still bad for the attacked side)
+    ksq_w = lsb(bb[5] & bb[WOCC])
+    ksq_b = lsb(bb[5] & bb[BOCC])
+    atk_w = attack_map(bb, mb, 0, occ)
+    atk_b = attack_map(bb, mb, 1, occ)
+    patk_w = _pawn_atk_mask(bb, 0)
+    patk_b = _pawn_atk_mask(bb, 1)
+
     for col in range(2):
         sign = 1 if col == 0 else -1
         them = 1 - col
-        ksq_them = lsb(bb[5] & bb[6 + them])
+        ksq_own = ksq_w if col == 0 else ksq_b
+        ksq_them = ksq_b if col == 0 else ksq_w
+        atk_own = atk_w if col == 0 else atk_b
+        atk_them = atk_b if col == 0 else atk_w
+        patk_them = patk_b if col == 0 else patk_w
         ring = KING_ATT[ksq_them] | (ONE << U(ksq_them))
         own = bb[6 + col]
         for pt in range(6):
@@ -950,6 +989,21 @@ def evaluate_hce(bb, mb):
                     if rh > 0:
                         w = 2 if pt <= 2 else (3 if pt == 3 else 5)
                         danger[them] += w * rh
+                # threats: a hanging piece (attacked, undefended) or a piece
+                # attacked by a pawn (bad trade even if "defended") signals
+                # real danger the static eval should see before the tree
+                # actually plays the capture out. Conservative fractions of
+                # material value - this is a first pass, kept modest on
+                # purpose given two earlier eval attempts tonight overshot.
+                if pt != 5:
+                    bit = ONE << U(sq)
+                    attacked = (bit & atk_them) != U(0)
+                    if attacked and (bit & atk_own) == U(0):
+                        mg -= sign * (MG_VAL[pt] // 6)
+                        eg -= sign * (EG_VAL[pt] // 6)
+                    elif pt >= 1 and (bit & patk_them) != U(0):
+                        mg -= sign * 8
+                        eg -= sign * 8
         # bishop pair
         if popcount(bb[2] & own) >= 2:
             mg += sign * 25
@@ -971,6 +1025,28 @@ def evaluate_hce(bb, mb):
                 rr_idx = (sq >> 3) if col == 0 else (7 - (sq >> 3))
                 mg += sign * _PASS_MG[rr_idx]
                 eg += sign * _PASS_EG[rr_idx]
+                # king race: reward our king being closer to escort this
+                # passer, penalize the enemy king being close enough to
+                # stop it - endgame only, tapering handles that.
+                eg += sign * 5 * (_cheb(ksq_them, sq) - _cheb(ksq_own, sq))
+        # king pawn shield: an open or over-advanced file next to our own
+        # king is a self-inflicted weakness - this is exactly the pattern
+        # that cost round 12 (an early ...g5 push with nothing in eval to
+        # flag the resulting hole). Middlegame-only in spirit; the mg/eg
+        # taper below already fades this out as pieces come off.
+        kf = ksq_own & 7
+        for df in (-1, 0, 1):
+            f = kf + df
+            if f < 0 or f > 7:
+                continue
+            file_pawns = own_p & FILE_BB[f]
+            if file_pawns == U(0):
+                mg -= sign * (16 if df == 0 else 9)
+            else:
+                sqp = lsb(file_pawns)
+                rr = (sqp >> 3) if col == 0 else (7 - (sqp >> 3))
+                if rr >= 3:  # pushed past the shield zone
+                    mg -= sign * (8 if df == 0 else 4)
         # rooks open files
         rr2 = bb[3] & own
         while rr2 != U(0):
@@ -1000,23 +1076,36 @@ def _king_danger(units):
 
 
 # --- NNUE ------------------------------------------------------------------
-# A king-relative (HalfKA-style) feature-transformer net: 49152 features
-# (own-king-square, piece/colour/square, "own vs their" from each
-# perspective) -> 256 accumulator (shared weights, one pass per perspective)
-# -> concat 512 -> 16 -> 1. Trained offline (see scratchpad/train_nnue.py in
-# dev) on Lichess Stockfish-eval positions and shipped as weights/nnue.npz -
-# not a binary, same category as the .onnx/.pt the rules explicitly allow.
-# Bucketing every feature by that perspective's own king square is what lets
-# the net learn king-relative patterns (shelter, an outpost near the king,
-# an open file toward it) at all - a flat piece-square table structurally
-# cannot represent that. The cost: every feature index for a perspective
-# depends on where that side's king is, so a king move invalidates the
-# whole perspective's accumulator - see _rebuild_one below.
+# A king-relative feature-transformer net: 24576 features (own-king bucket x
+# piece/colour/square, "own vs their" from each perspective) -> 256
+# accumulator (shared weights, one pass per perspective) -> concat 512 -> 16
+# -> 1. Trained offline (see scratchpad/train_nnue.py in dev) on Lichess
+# Stockfish-eval positions and shipped as weights/nnue.npz - not a binary,
+# same category as the .onnx/.pt the rules explicitly allow.
+#
+# King bucket: 32 = 4 rank-bands x 8 files, ((king_rank >> 1) * 8 + file),
+# from that perspective's own back rank. An earlier 8-bucket (file only)
+# net plateaued because it cannot distinguish a king on the back rank from
+# one on rank 4 - most of king safety. A still-earlier note here claimed
+# full 64 buckets cost 3.8x per lookup and ~5.7x NPS; that came from a
+# benchmark using uniformly-random lookups across the whole table. The real
+# search access pattern is localized to the current king's bucket (~one
+# bucket's rows hot at a time), and re-benchmarked that way a 32-bucket
+# table costs ~1.2x, a 64-bucket ~1.5x, only on king moves. 32 buckets =
+# 24576x256 int16 = ~12.6MB, fits the zip budget with room to spare.
+# The cost: every feature index for a perspective depends on where that
+# side's king is, so a king move invalidates the whole perspective's
+# accumulator - see _rebuild_one below.
+# NNUE_W_FT is int16 (quantized by the trainer's export()). NNUE_FT_SCALE
+# undoes the quantization once the integer accumulator is converted back to
+# float for the L1/L2 layers, which stay float32 - they're tiny (256+16
+# dims) and were never the bottleneck.
 _NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
 NNUE_OK = False
 try:
     _nz = np.load(_NNUE_PATH)
-    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.float32)  # [49152,256]
+    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.int16)  # [24576,256] quantized
+    NNUE_FT_SCALE = float(_nz["ft_scale"])
     NNUE_B_FT = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)  # [256]
     NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,16]
     NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [16]
@@ -1025,7 +1114,8 @@ try:
     NNUE_SCALE = float(_nz["scale"])
     NNUE_OK = True
 except Exception:
-    NNUE_W_FT = np.zeros((49152, 256), np.float32)
+    NNUE_W_FT = np.zeros((6144, 256), np.int16)
+    NNUE_FT_SCALE = 1.0
     NNUE_B_FT = np.zeros(256, np.float32)
     NNUE_W_L1 = np.zeros((512, 16), np.float32)
     NNUE_B_L1 = np.zeros(16, np.float32)
@@ -1033,32 +1123,56 @@ except Exception:
     NNUE_B_L2 = 0.0
     NNUE_SCALE = 100.0
 
+# L1 stored transposed, [16,512] contiguous. The forward pass reduces over the
+# 512 inputs for each of the 16 outputs; with the natural [512,16] layout that
+# reduction strides by 16 floats and LLVM cannot vectorize it, which is what
+# made the old scalar version cost 3009ns. Transposed, the inner loop walks
+# contiguous memory and auto-vectorizes to 755ns - 4.0x, for a transpose done
+# once at import. (np.dot would also vectorize, but numba routes it through
+# scipy's BLAS and scipy is NOT in the platform's preinstalled stack.)
+NNUE_W_L1_T = np.ascontiguousarray(NNUE_W_L1.T)  # [16,512]
+
 
 @njit(cache=False, inline="always")
 def _ft_feature(code, sq, persp, king_sq_persp):
-    """49152-wide feature index for one piece from perspective `persp`
-    (0/1), bucketed by that perspective's own king square (already
-    perspective-relative, i.e. pre-flipped for persp==1 same as any
-    other square)."""
+    """24576-wide feature index for one piece from perspective `persp` (0/1),
+    bucketed by that perspective's own king square reduced to 32 buckets:
+    4 rank-bands x 8 files = ((rank >> 1) * 8 + file). king_sq_persp is
+    already perspective-relative (pre-flipped by ^56 for persp==1), so the
+    rank-band is measured from that perspective's own back rank.
+
+    Keep this identical to feat_index / _king_bucket in train_nnue.py - a
+    mismatch here silently feeds the net garbage indices."""
     pt = code % 6
     colour = code // 6
     own = 1 if colour == persp else 0
     sq_rel = sq if persp == 0 else (sq ^ 56)
     flat = (pt * 2 + (1 - own)) * 64 + sq_rel
-    return king_sq_persp * 768 + flat
+    bucket = ((king_sq_persp >> 3) >> 1) * 8 + (king_sq_persp & 7)
+    return bucket * 768 + flat
 
 
 @njit(cache=False, inline="always")
-def _rebuild_one(mb, acc, persp, king_sq_persp):
+def _rebuild_one(bb, mb, acc, persp, king_sq_persp):
     """Full O(pieces) rebuild of a single perspective's accumulator. Needed
     whenever that perspective's own king moves, since every feature index
     for it is bucketed by king square - an incremental diff can't fix that,
-    the whole accumulator is stale."""
-    acc[:] = NNUE_B_FT
-    for sq in range(64):
+    the whole accumulator is stale. Walks the occupancy bitboard (~pieces
+    iterations) rather than all 64 mailbox slots - king moves are common
+    enough in search that this loop runs a lot, so skipping ~40 empty-square
+    checks per rebuild is worth it.
+
+    acc is the int32 quantized accumulator - it holds the raw sum of
+    quantized int16 feature rows, nothing else. The bias is float32 and
+    only gets added once, in nnue_from_acc, after converting back out of
+    the quantized domain - adding it here (once per active piece, in a
+    loop) would be both wrong and pointless."""
+    acc[:] = 0
+    occ = bb[OCC]
+    while occ != U(0):
+        sq = lsb(occ)
+        occ &= occ - ONE
         code = mb[sq]
-        if code < 0:
-            continue
         acc += NNUE_W_FT[_ft_feature(code, sq, persp, king_sq_persp)]
 
 
@@ -1068,8 +1182,8 @@ def build_acc(bb, mb, acc_w, acc_b):
     once per search, not per node."""
     kw = lsb(bb[5] & bb[WOCC])
     kb = lsb(bb[5] & bb[BOCC]) ^ 56
-    _rebuild_one(mb, acc_w, 0, kw)
-    _rebuild_one(mb, acc_b, 1, kb)
+    _rebuild_one(bb, mb, acc_w, 0, kw)
+    _rebuild_one(bb, mb, acc_b, 1, kb)
 
 
 @njit(cache=False, inline="always")
@@ -1110,7 +1224,7 @@ def make_move_acc(bb, mb, gh, ply, m, acc_w, acc_b):
         # can still be diffed with its (unchanged) king square.
         kw = lsb(bb[5] & bb[WOCC])
         if b0 == 5:
-            _rebuild_one(mb, acc_w, 0, kw)
+            _rebuild_one(bb, mb, acc_w, 0, kw)
         else:
             _apply_diff_one(mb, frm, b0, acc_w, 0, kw)
             _apply_diff_one(mb, to, b1, acc_w, 0, kw)
@@ -1120,7 +1234,7 @@ def make_move_acc(bb, mb, gh, ply, m, acc_w, acc_b):
                 _apply_diff_one(mb, sq3, b3, acc_w, 0, kw)
         kb = lsb(bb[5] & bb[BOCC]) ^ 56
         if b0 == 11:
-            _rebuild_one(mb, acc_b, 1, kb)
+            _rebuild_one(bb, mb, acc_b, 1, kb)
         else:
             _apply_diff_one(mb, frm, b0, acc_b, 1, kb)
             _apply_diff_one(mb, to, b1, acc_b, 1, kb)
@@ -1155,7 +1269,7 @@ def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
     if USE_NNUE:
         kw = lsb(bb[5] & bb[WOCC])
         if white_king_moved:
-            _rebuild_one(mb, acc_w, 0, kw)
+            _rebuild_one(bb, mb, acc_w, 0, kw)
         else:
             _apply_diff_one(mb, frm, b0, acc_w, 0, kw)
             _apply_diff_one(mb, to, b1, acc_w, 0, kw)
@@ -1165,7 +1279,7 @@ def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
                 _apply_diff_one(mb, sq3, b3, acc_w, 0, kw)
         kb = lsb(bb[5] & bb[BOCC]) ^ 56
         if black_king_moved:
-            _rebuild_one(mb, acc_b, 1, kb)
+            _rebuild_one(bb, mb, acc_b, 1, kb)
         else:
             _apply_diff_one(mb, frm, b0, acc_b, 1, kb)
             _apply_diff_one(mb, to, b1, acc_b, 1, kb)
@@ -1179,48 +1293,56 @@ def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
 def nnue_eval(bb, mb):
     """Full recompute from scratch - reference implementation, used to (re)seed
     the incremental accumulators and to cross-check them in tests."""
-    acc_w = NNUE_B_FT.copy()
-    acc_b = NNUE_B_FT.copy()
+    acc_w = np.zeros(256, np.int32)
+    acc_b = np.zeros(256, np.int32)
     build_acc(bb, mb, acc_w, acc_b)
     return nnue_from_acc(bb, acc_w, acc_b)
 
 
-@njit(cache=False)
+@njit(cache=False, fastmath=True)
 def nnue_from_acc(bb, acc_w, acc_b):
     """Forward pass from already-maintained accumulators - no board walk.
     Explicit scalar loops (no numpy row slicing/broadcasting in the hot path -
     that was allocating a temporary 16-wide array on every one of the 256
-    iterations and cost 23x a whole HCE eval)."""
-    stm = I(bb[STM])
-    a_stm = acc_w if stm == 0 else acc_b
-    a_opp = acc_b if stm == 0 else acc_w
+    iterations and cost 23x a whole HCE eval).
 
-    h = np.empty(16, np.float32)
-    for k in range(16):
-        h[k] = NNUE_B_L1[k]
-    # relu(a)[i] == a[i] when a[i] > 0, else contributes nothing - skip the
-    # separate np.maximum pass and just gate on the raw accumulator.
+    acc_w/acc_b are int32 (raw sums of quantized int16 feature rows, no
+    bias yet - see _rebuild_one). Undo the quantization and add the bias
+    here, once per element, before the L1 gate - a cheap per-eval cost
+    (256 elements) compared to the O(pieces) accumulation work it's built
+    from."""
+    stm = I(bb[STM])
+    a_stm_i = acc_w if stm == 0 else acc_b
+    a_opp_i = acc_b if stm == 0 else acc_w
+    inv_scale = np.float32(1.0) / NNUE_FT_SCALE
+
+    # Materialize relu(accumulator) into one contiguous 512-wide buffer, then do
+    # a dense matvec against the transposed L1. The old version instead branched
+    # per input and scattered into h[0:16], which skipped ~half the work but ran
+    # entirely scalar; doing all 512 lanes unconditionally is 4x cheaper because
+    # the reduction vectorizes. Both perspectives are filled in one pass so the
+    # two accumulator reads share the loop overhead.
+    buf = np.empty(512, np.float32)
     for i in range(256):
-        s = a_stm[i]
-        if s > 0.0:
-            for k in range(16):
-                h[k] += s * NNUE_W_L1[i, k]
-    for i in range(256):
-        o = a_opp[i]
-        if o > 0.0:
-            for k in range(16):
-                h[k] += o * NNUE_W_L1[256 + i, k]
+        s = a_stm_i[i] * inv_scale + NNUE_B_FT[i]
+        buf[i] = s if s > 0.0 else np.float32(0.0)
+        o = a_opp_i[i] * inv_scale + NNUE_B_FT[i]
+        buf[256 + i] = o if o > 0.0 else np.float32(0.0)
     out = NNUE_B_L2
-    for i in range(16):
-        v = h[i]
-        if v > 0.0:
-            out += v * NNUE_W_L2[i]
+    for k in range(16):
+        acc = NNUE_B_L1[k]
+        row = NNUE_W_L1_T[k]  # contiguous 512 floats - the point of the transpose
+        for i in range(512):
+            acc += buf[i] * row[i]
+        if acc > 0.0:  # L1 relu
+            out += acc * NNUE_W_L2[k]
     return I(out * NNUE_SCALE) + 14
 
 
 # FASTCHESS_NNUE=1 switches the search onto the net for A/B testing; baked in
 # at import (numba freezes plain globals as compile-time constants).
 USE_NNUE = NNUE_OK and os.environ.get("FASTCHESS_NNUE", "0") == "1"
+SELECTIVE_NNUE = USE_NNUE and os.environ.get("FASTCHESS_NNUE_SELECTIVE", "0") == "1"
 
 
 @njit(cache=False)
@@ -1228,6 +1350,22 @@ def evaluate(bb, mb, acc_w, acc_b):
     if USE_NNUE:
         return nnue_from_acc(bb, acc_w, acc_b)
     return evaluate_hce(bb, mb)
+
+
+@njit(cache=False, inline="always")
+def evaluate_search(bb, mb, acc_w, acc_b, depth, is_pv):
+    if USE_NNUE and (not SELECTIVE_NNUE or (is_pv and depth >= 4)):
+        return nnue_from_acc(bb, acc_w, acc_b)
+    return evaluate_hce(bb, mb)
+
+
+@njit(cache=False, inline="always")
+def evaluate_qsearch(bb, mb, acc_w, acc_b):
+    # Quiescence visits many more nodes than the main search; HCE keeps those
+    # leaf evaluations cheap while NNUE still scores regular search nodes.
+    if USE_NNUE:
+        return evaluate_hce(bb, mb)
+    return evaluate(bb, mb, acc_w, acc_b)
 
 
 # --- search -------------------------------------------------------------------
@@ -1251,6 +1389,21 @@ N_NODES, N_STOP, N_MAXN, N_SELD, N_GPLY = 0, 1, 2, 3, 4
 MATE_S = MATE
 MIMAX = MATE_IN_MAX
 INF_S = INF
+
+# Search-parameter knobs, read once at import so a sweep can override any of them
+# without a separate build. Numba freezes plain module globals as compile-time
+# constants when the @njit functions below compile, so these must be resolved
+# here, not inside a hot-path function. Every default reproduces the previous
+# hardcoded literal exactly - unset, behaviour is byte-for-byte unchanged.
+_RFP_MARGIN = int(os.environ.get("FASTCHESS_RFP_MARGIN", "80"))
+_RFP_MAX_DEPTH = int(os.environ.get("FASTCHESS_RFP_MAX_DEPTH", "6"))
+_NULLMOVE_R_BASE = int(os.environ.get("FASTCHESS_NULLMOVE_R_BASE", "3"))
+_NULLMOVE_R_DIV = int(os.environ.get("FASTCHESS_NULLMOVE_R_DIV", "4"))
+_FUTILITY_MARGIN = int(os.environ.get("FASTCHESS_FUTILITY_MARGIN", "90"))
+_LMP_BASE = int(os.environ.get("FASTCHESS_LMP_BASE", "4"))
+_LMR_I1 = int(os.environ.get("FASTCHESS_LMR_I1", "6"))    # move index for +1 reduction
+_LMR_I2 = int(os.environ.get("FASTCHESS_LMR_I2", "12"))   # move index for the 2nd +1
+_LMR_D2 = int(os.environ.get("FASTCHESS_LMR_D2", "6"))    # depth gate for the 2nd +1
 
 
 @njit(cache=False, inline="always")
@@ -1335,7 +1488,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
         return 0
     checked = in_check(bb, mb)
     if not checked:
-        stand = evaluate(bb, mb, acc_w, acc_b)
+        stand = evaluate_qsearch(bb, mb, acc_w, acc_b)
         if stand >= beta:
             return stand
         if stand > alpha:
@@ -1343,7 +1496,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     else:
         stand = -INF_S
     if ply >= MAX_PLY - 1:
-        return stand if not checked else evaluate(bb, mb, acc_w, acc_b)
+        return stand if not checked else evaluate_qsearch(bb, mb, acc_w, acc_b)
 
     buf = mv[ply]
     n = gen_moves(bb, mb, buf, not checked)
@@ -1361,9 +1514,15 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
             attacker = MG_VAL[mb[m_from(m)] % 6]
             if victim + 90 < attacker and stand + victim + 150 < alpha:
                 continue
-        make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
+        if USE_NNUE:
+            make_move(bb, mb, gh, gp + ply, m)
+        else:
+            make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
         s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
-        unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
+        if USE_NNUE:
+            unmake_move(bb, mb, gh, gp + ply)
+        else:
+            unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
         if ct[N_STOP] == 1:
             return 0
         if s > best:
@@ -1389,7 +1548,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     if ply > 0 and _rep_or_50(bb, gh, ct, ply):
         return 0
     if ply >= MAX_PLY - 1:
-        return evaluate(bb, mb, acc_w, acc_b)
+        return evaluate_search(bb, mb, acc_w, acc_b, depth, is_pv)
 
     if alpha < -MATE_S + ply:
         alpha = -MATE_S + ply
@@ -1423,14 +1582,14 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
             if fl == 3 and s <= alpha:
                 return s
 
-    static = -INF_S if checked else evaluate(bb, mb, acc_w, acc_b)
+    static = -INF_S if checked else evaluate_search(bb, mb, acc_w, acc_b, depth, is_pv)
 
-    can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
-    if can_rfp and static - 80 * depth >= beta:
+    can_rfp = (not is_pv) and (not checked) and depth <= _RFP_MAX_DEPTH and abs(beta) < MIMAX
+    if can_rfp and static - _RFP_MARGIN * depth >= beta:
         return static
 
     if (not is_pv) and (not checked) and depth >= 3 and static >= beta and _has_np(bb, I(bb[STM])):
-        r = 3 + depth // 4
+        r = _NULLMOVE_R_BASE + depth // _NULLMOVE_R_DIV
         make_null(bb, gh, ct[N_GPLY] + ply)
         s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
                       depth - r, ply + 1, -beta, -beta + 1, False)
@@ -1457,9 +1616,9 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
         quiet = (not m_is_cap(m)) and (not m_is_promo(m))
 
         if (not is_pv) and (not checked) and quiet and best > -MIMAX:
-            if depth <= 4 and i >= 4 + depth * depth:
+            if depth <= 4 and i >= _LMP_BASE + depth * depth:
                 continue
-            if depth <= 3 and static + 90 * depth <= alpha and i > 0:
+            if depth <= 3 and static + _FUTILITY_MARGIN * depth <= alpha and i > 0:
                 continue
 
         make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
@@ -1471,7 +1630,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
         else:
             r = 0
             if depth >= 3 and quiet and (not gives_check) and (not checked):
-                r = 1 + (1 if i >= 6 else 0) + (1 if (depth >= 6 and i >= 12) else 0)
+                r = 1 + (1 if i >= _LMR_I1 else 0) + (1 if (depth >= _LMR_D2 and i >= _LMR_I2) else 0)
                 if is_pv:
                     r -= 1
                 if r < 0:
@@ -1579,8 +1738,8 @@ class Engine:
         self.hi = np.zeros((2, 64, 64), np.int32)
         self.mv = np.zeros((MAX_PLY, 256), np.int32)
         self.ct = np.zeros(8, np.int64)
-        self.acc_w = np.zeros(256, np.float32)
-        self.acc_b = np.zeros(256, np.float32)
+        self.acc_w = np.zeros(256, np.int32)  # raw quantized-FT sums; see nnue_from_acc
+        self.acc_b = np.zeros(256, np.int32)
         # warm the JIT (compiles the whole graph)
         bb, mb = fen_to_arrays("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
         build_acc(bb, mb, self.acc_w, self.acc_b)

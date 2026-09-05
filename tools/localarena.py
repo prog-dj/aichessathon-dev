@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import math
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -51,6 +53,8 @@ class GameResult:
     result: str  # "white" | "black" | "draw"
     termination: str
     plies: int
+    white_min_clock_ms: float
+    black_min_clock_ms: float
 
 
 def load_agent(directory: Path) -> GetMove:
@@ -65,6 +69,12 @@ def load_agent(directory: Path) -> GetMove:
         raise RuntimeError(f"cannot load {source}")
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(directory))
+    # NOTE: only ONE build can be loaded per process. agent.py does a plain
+    # `import fastchess`, which lands in sys.modules under its bare name, so a
+    # second in-process load silently reuses the first build's engine - and
+    # numba refuses to be re-imported if you try to purge and reload it
+    # ("cannot load module more than once per process"). Comparing two builds
+    # therefore requires one subprocess per build: see spawn_agent below.
     try:
         sys.modules[name] = module
         spec.loader.exec_module(module)
@@ -74,6 +84,60 @@ def load_agent(directory: Path) -> GetMove:
     if not callable(get_move):
         raise RuntimeError(f"{source} has no get_move function")
     return get_move  # type: ignore[no-any-return]
+
+
+_DRIVER = """
+import sys, json, io
+sys.path.insert(0, sys.argv[1])
+_real = sys.stdout
+sys.stdout = io.StringIO()          # agent.py prints diagnostics at import
+import agent
+sys.stdout = _real
+sys.stdout.write(json.dumps({"ready": 1}) + chr(10)); sys.stdout.flush()
+for line in sys.stdin:
+    r = json.loads(line)
+    sys.stdout = io.StringIO()
+    try:
+        uci = agent.get_move(r["fen"], r["time_left_ms"])
+    except Exception as e:
+        sys.stdout = _real
+        sys.stdout.write(json.dumps({"error": str(e)}) + chr(10)); sys.stdout.flush()
+        continue
+    sys.stdout = _real
+    sys.stdout.write(json.dumps({"move": uci}) + chr(10)); sys.stdout.flush()
+"""
+
+
+class _SubprocessAgent:
+    """One build, in its own process. Required for correctness: two builds
+    cannot coexist in a single process (see the note in load_agent), so any
+    A/B where fastchess.py differs MUST use this, not load_agent."""
+
+    def __init__(self, directory: Path, env: dict[str, str] | None = None) -> None:
+        environment = dict(os.environ)
+        if env:
+            environment.update(env)
+        self._proc = subprocess.Popen(
+            [sys.executable, "-c", _DRIVER, str(directory.resolve())],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=environment,
+        )
+        line = self._proc.stdout.readline()  # type: ignore[union-attr]
+        if not line or json.loads(line).get("ready") != 1:
+            raise RuntimeError(f"{directory} failed to start")
+
+    def __call__(self, fen: str, time_left_ms: int) -> str:
+        self._proc.stdin.write(  # type: ignore[union-attr]
+            json.dumps({"fen": fen, "time_left_ms": int(time_left_ms)}) + "\n"
+        )
+        self._proc.stdin.flush()  # type: ignore[union-attr]
+        reply = json.loads(self._proc.stdout.readline())  # type: ignore[union-attr]
+        if "error" in reply:
+            raise RuntimeError(reply["error"])
+        return str(reply["move"])
+
+    def close(self) -> None:
+        self._proc.kill()
 
 
 def _other(colour: chess.Color) -> str:
@@ -110,6 +174,10 @@ def play_game(
     board = chess.Board()
     agents = {chess.WHITE: white, chess.BLACK: black}
     clock = {chess.WHITE: float(base_ms), chess.BLACK: float(base_ms)}
+    min_clock = {chess.WHITE: float(base_ms), chess.BLACK: float(base_ms)}
+
+    def _result(result: str, termination: str, plies: int) -> GameResult:
+        return GameResult(result, termination, plies, min_clock[chess.WHITE], min_clock[chess.BLACK])
 
     while True:
         outcome = board.outcome(claim_draw=True)
@@ -117,24 +185,25 @@ def play_game(
             plies = len(board.move_stack)
             name = outcome.termination.name.lower()
             if outcome.winner is None:
-                return GameResult("draw", name, plies)
-            return GameResult("white" if outcome.winner else "black", name, plies)
+                return _result("draw", name, plies)
+            return _result("white" if outcome.winner else "black", name, plies)
         if len(board.move_stack) >= ply_cap:
-            return GameResult(_adjudicate(board), "adjudication", len(board.move_stack))
+            return _result(_adjudicate(board), "adjudication", len(board.move_stack))
 
         mover = board.turn
+        min_clock[mover] = min(min_clock[mover], clock[mover])
         started_at = time.monotonic()
         try:
             uci = agents[mover](board.fen(), int(clock[mover]))
         except Exception:  # an agent crash is a loss, exactly as on the platform
-            return GameResult(_other(mover), "crash", len(board.move_stack))
+            return _result(_other(mover), "crash", len(board.move_stack))
         clock[mover] -= (time.monotonic() - started_at) * 1000.0
         if clock[mover] < 0:
-            return GameResult(_other(mover), "flag", len(board.move_stack))
+            return _result(_other(mover), "flag", len(board.move_stack))
 
         move = _parse_legal(board, uci)
         if move is None:
-            return GameResult(_other(mover), "illegal", len(board.move_stack))
+            return _result(_other(mover), "illegal", len(board.move_stack))
         board.push(move)
         clock[mover] += increment_ms
 
@@ -147,20 +216,48 @@ class _Job:
     base_ms: int
     increment_ms: int
     ply_cap: int
+    # env overrides applied to the AGENT side only, so a search-parameter sweep
+    # can test a candidate against the same build with stock settings. Tuple of
+    # pairs rather than a dict to stay hashable/picklable for the process pool.
+    agent_env: tuple[tuple[str, str], ...] = ()
 
 
-def _run_job(job: _Job) -> tuple[str, str, int]:
-    """Play one game in a worker. Agents are loaded fresh, as a new process would."""
-    agent = load_agent(Path(job.agent_dir))
-    opponent = load_agent(Path(job.opponent_dir))
-    white, black = (agent, opponent) if job.agent_is_white else (opponent, agent)
-    result = play_game(white, black, job.base_ms, job.increment_ms, job.ply_cap)
+@dataclass(frozen=True)
+class _JobResult:
+    scored_for_agent: str  # "win" | "draw" | "loss"
+    termination: str
+    plies: int
+    agent_min_clock_ms: float
+    opponent_min_clock_ms: float
+    agent_is_white: bool
+
+
+def _run_job(job: _Job) -> _JobResult:
+    """Play one game. Each build runs in its OWN subprocess - two builds cannot
+    share a process (the second would silently reuse the first's fastchess),
+    so this is what makes a fastchess.py-level A/B mean anything."""
+    agent = _SubprocessAgent(Path(job.agent_dir), dict(job.agent_env))
+    opponent = _SubprocessAgent(Path(job.opponent_dir))
+    try:
+        white, black = (agent, opponent) if job.agent_is_white else (opponent, agent)
+        result = play_game(white, black, job.base_ms, job.increment_ms, job.ply_cap)
+    finally:
+        agent.close()
+        opponent.close()
     scored_for_agent = (
         "draw"
         if result.result == "draw"
         else ("win" if (result.result == "white") == job.agent_is_white else "loss")
     )
-    return scored_for_agent, result.termination, result.plies
+    agent_min_clock, opponent_min_clock = (
+        (result.white_min_clock_ms, result.black_min_clock_ms)
+        if job.agent_is_white
+        else (result.black_min_clock_ms, result.white_min_clock_ms)
+    )
+    return _JobResult(
+        scored_for_agent, result.termination, result.plies,
+        agent_min_clock, opponent_min_clock, job.agent_is_white,
+    )
 
 
 def _elo(score: float) -> float:
@@ -191,7 +288,20 @@ def main() -> None:
     parser.add_argument("--increment-ms", type=int, default=FAST_INCREMENT_MS)
     parser.add_argument("--ply-cap", type=int, default=PLY_CAP)
     parser.add_argument("--workers", type=int, default=1, help="0 picks a sensible default")
+    parser.add_argument(
+        "--per-game", action="store_true",
+        help="print each game's result and both sides' min-clock, not just the aggregate",
+    )
+    parser.add_argument(
+        "--agent-env", action="append", default=[], metavar="KEY=VALUE",
+        help="env override applied to the agent side only (repeatable), e.g. "
+             "--agent-env FASTCHESS_NULLMOVE_R_BASE=4",
+    )
     arguments = parser.parse_args()
+
+    agent_env: tuple[tuple[str, str], ...] = tuple(
+        (k, v) for k, _, v in (pair.partition("=") for pair in arguments.agent_env)
+    )
 
     workers = arguments.workers or max(1, min(8, os.cpu_count() or 2) - 1)
     jobs = [
@@ -202,13 +312,14 @@ def main() -> None:
             base_ms=arguments.base_ms,
             increment_ms=arguments.increment_ms,
             ply_cap=arguments.ply_cap,
+            agent_env=agent_env,
         )
         for game in range(arguments.games)
     ]
 
     wins = draws = losses = 0
     terminations: dict[str, int] = {}
-    results: list[tuple[str, str, int]]
+    results: list[_JobResult]
     if workers == 1:
         results = [_run_job(job) for job in jobs]
     else:
@@ -223,13 +334,25 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=1) as pool:
             results = list(pool.map(_run_job, jobs))
 
+    if arguments.per_game:
+        print("\nper-game:")
+        for i, r in enumerate(results, 1):
+            colour = "W" if r.agent_is_white else "B"
+            print(
+                f"  g{i:>3} agent={colour}  {r.scored_for_agent:<4s} {r.termination:<22s} "
+                f"plies={r.plies:>4}  agent_min={r.agent_min_clock_ms/1000:>6.1f}s  "
+                f"opp_min={r.opponent_min_clock_ms/1000:>6.1f}s"
+            )
+
     total_plies = 0
-    for scored, termination, plies in results:
-        terminations[termination] = terminations.get(termination, 0) + 1
-        total_plies += plies
-        if scored == "win":
+    min_clocks: list[float] = []
+    for r in results:
+        terminations[r.termination] = terminations.get(r.termination, 0) + 1
+        total_plies += r.plies
+        min_clocks.append(r.agent_min_clock_ms)
+        if r.scored_for_agent == "win":
             wins += 1
-        elif scored == "draw":
+        elif r.scored_for_agent == "draw":
             draws += 1
         else:
             losses += 1
@@ -241,10 +364,31 @@ def main() -> None:
     print(f"Elo {_elo(score):+.0f} +/- {_margin(wins, draws, losses):.0f}")
     print(f"avg game length {total_plies / games:.0f} plies" if games else "no games")
     print("terminations: " + ", ".join(f"{k} {v}" for k, v in sorted(terminations.items())))
+    if min_clocks:
+        avg_min_clock = sum(min_clocks) / len(min_clocks)
+        panic_frac = sum(1 for c in min_clocks if c < 4000) / len(min_clocks)
+        danger_frac = sum(1 for c in min_clocks if c < 10_000) / len(min_clocks)
+        print(
+            f"agent min-clock: avg {avg_min_clock/1000:.1f}s, "
+            f"{panic_frac:.0%} of games dipped under 4s (panic), "
+            f"{danger_frac:.0%} under 10s (danger)"
+        )
+        # the actual question this instrumentation exists to answer: in games where
+        # the *opponent* ran into real time trouble, did the agent (with whichever
+        # time-management build it's running) come out ahead?
+        opp_in_danger = [r for r in results if r.opponent_min_clock_ms < 10_000]
+        if opp_in_danger:
+            w = sum(1 for r in opp_in_danger if r.scored_for_agent == "win")
+            d = sum(1 for r in opp_in_danger if r.scored_for_agent == "draw")
+            losses_ = sum(1 for r in opp_in_danger if r.scored_for_agent == "loss")
+            sc = (w + 0.5 * d) / len(opp_in_danger)
+            print(
+                f"in the {len(opp_in_danger)} game(s) where the OPPONENT dipped under 10s: "
+                f"agent scored +{w} ={d} -{losses_} ({sc:.0%})"
+            )
     broken = {k: v for k, v in terminations.items() if k in FAILED_TERMINATIONS}
     agent_broke = any(
-        scored == "loss" and termination in FAILED_TERMINATIONS
-        for scored, termination, _ in results
+        r.scored_for_agent == "loss" and r.termination in FAILED_TERMINATIONS for r in results
     )
     if agent_broke:
         print("WARNING: your agent lost at least one game to crash / illegal / flag")
