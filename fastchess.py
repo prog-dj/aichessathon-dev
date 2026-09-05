@@ -1675,8 +1675,12 @@ class Engine:
         bb, mb = fen_to_arrays(fen)
         gp = _seed_history(bb, mb, list(moves), self.gh)
         build_acc(bb, mb, self.acc_w, self.acc_b)  # O(pieces), once per move
+        # Decay rather than wipe the quiet-move history between moves: consecutive
+        # positions in a game share which quiets are good/bad, and a full zero
+        # every move throws that away. Halving keeps recent signal and bounds
+        # the table. Killers are ply-indexed and churn fast, so still cleared.
         self.kl[:, :] = 0
-        self.hi[:, :, :] = 0
+        self.hi >>= np.int32(1)
         self.ct[:] = 0
         self.ct[N_GPLY] = gp
 
