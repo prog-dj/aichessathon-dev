@@ -1327,6 +1327,77 @@ def _order(bb, mb, kl, hi, buf, n, ply, tt_move):
         buf[j + 1] = mm
 
 
+_SEE_VAL = np.array([100, 320, 330, 500, 900, 20000], np.int64)  # P N B R Q K
+
+
+@njit(cache=False)
+def see_gain(bb, mb, m):
+    """Static exchange evaluation of capture `m`, in centipawns, from the POV of
+    the side making it: the material won (or lost, if negative) after both sides
+    recapture on the target square with their least valuable piece each time.
+    Quiet non-promotions return 0. Handles en passant, capture-promotions, and
+    x-ray sliders; no pin awareness (a pinned recapturer is counted - the
+    standard SEE approximation).  CPW gain-list negamax."""
+    frm = m_from(m)
+    to = m_to(m)
+    flag = m_flag(m)
+    us = I(bb[STM])
+    tpc = mb[to]
+    if flag != EP_FLAG and tpc < 0 and not m_is_promo(m):
+        return 0
+
+    if flag == EP_FLAG:
+        gain0 = _SEE_VAL[0]
+        ep_sq = to - 8 if us == 0 else to + 8
+        occ = bb[OCC] ^ (ONE << U(frm)) ^ (ONE << U(ep_sq))
+    else:
+        gain0 = _SEE_VAL[tpc % 6] if tpc >= 0 else np.int64(0)
+        occ = bb[OCC] ^ (ONE << U(frm))
+
+    if m_is_promo(m):
+        pp = m_promo_pt(m)                     # 1..4 -> N B R Q
+        gain0 += _SEE_VAL[pp] - _SEE_VAL[0]
+        on_to = _SEE_VAL[pp]
+    else:
+        on_to = _SEE_VAL[mb[frm] % 6]
+
+    gain = np.empty(32, np.int64)
+    gain[0] = gain0
+    d = 0
+    side = 1 - us
+    attackers = (attackers_to(bb, mb, to, 0, occ)
+                 | attackers_to(bb, mb, to, 1, occ)) & occ
+    while True:
+        d += 1
+        gain[d] = on_to - gain[d - 1]
+        if gain[d] < 0 and -gain[d - 1] < 0:   # neither side can improve here
+            break
+        side_att = attackers & bb[6 + side]
+        if side_att == U(0):
+            break
+        lva_pt = 0
+        lva_bit = U(0)
+        for pt in range(6):
+            s = side_att & bb[pt]
+            if s != U(0):
+                lva_pt = pt
+                lva_bit = s & (-s)            # lowest set bit
+                break
+        occ ^= lva_bit
+        on_to = _SEE_VAL[lva_pt]
+        attackers = (attackers_to(bb, mb, to, 0, occ)
+                     | attackers_to(bb, mb, to, 1, occ)) & occ
+        side = 1 - side
+        if lva_pt == 5 and (attackers & bb[6 + side]) != U(0):
+            # king "captured" into a square still defended - illegal, drop this ply
+            break
+    # CPW negamax fold-back: `while (--d) gain[d-1] = -max(-gain[d-1], gain[d])`
+    while d > 1:
+        d -= 1
+        gain[d - 1] = -max(-gain[d - 1], gain[d])
+    return gain[0]
+
+
 @njit(cache=False)
 def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     ct[N_NODES] += 1
@@ -1360,6 +1431,11 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
             victim = MG_VAL[mb[to] % 6] if mb[to] >= 0 else 100
             attacker = MG_VAL[mb[m_from(m)] % 6]
             if victim + 90 < attacker and stand + victim + 150 < alpha:
+                continue
+            # SEE prune: a capture that loses material after the full exchange
+            # is almost never worth a qsearch subtree - the recapture just
+            # gets found one ply deeper at the cost of a whole node fan-out.
+            if see_gain(bb, mb, m) < 0:
                 continue
         make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
         s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
