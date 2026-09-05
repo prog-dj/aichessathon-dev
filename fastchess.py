@@ -1352,8 +1352,8 @@ def see_gain(bb, mb, m):
     flag = m_flag(m)
     us = I(bb[STM])
     tpc = mb[to]
-    if flag != EP_FLAG and tpc < 0 and not m_is_promo(m):
-        return 0
+    # (quiet moves fall through: gain0 stays 0, so the result is <=0 exactly
+    #  when the moved piece can be won on `to` - "does this move hang material")
 
     if flag == EP_FLAG:
         gain0 = _SEE_VAL[0]
@@ -1546,6 +1546,13 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
                 continue
             if depth <= 3 and static + 90 * depth <= alpha and i > 0:
                 continue
+
+        # SEE prune losing captures in the main search too (not just qsearch):
+        # a capture that drops a piece after the exchange, at shallow depth on a
+        # non-PV node, is rarely worth a full subtree. Cheap - few captures/node.
+        if (not is_pv) and (not checked) and (not quiet) and best > -MIMAX \
+                and i > 0 and depth <= 6 and see_gain(bb, mb, m) < -95 * depth:
+            continue
 
         make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
         gives_check = in_check(bb, mb)
