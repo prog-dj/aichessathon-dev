@@ -84,22 +84,26 @@ def _stream_rows(src: str | None, limit: int):
 def _process(rows: list[tuple[str, float]]):
     import chess
 
-    n = len(rows)
-    fw = np.full((n, MAX_PIECES), PAD, np.int16)
-    fb = np.full((n, MAX_PIECES), PAD, np.int16)
-    cnt = np.zeros(n, np.uint8)
-    cp = np.zeros(n, np.float32)
-    wtm = np.zeros(n, np.bool_)
-    for i, (fen, cpw) in enumerate(rows):
-        b = chess.Board(fen)
+    fw_l, fb_l, cnt_l, cp_l, wtm_l = [], [], [], [], []
+    for fen, cpw in rows:
+        try:
+            b = chess.Board(fen)
+        except ValueError:
+            continue
         iw, ib = board_features(b)
         k = len(iw)
-        fw[i, :k] = iw
-        fb[i, :k] = ib
-        cnt[i] = k
-        cp[i] = cpw
-        wtm[i] = b.turn == chess.WHITE
-    return fw, fb, cnt, cp, wtm
+        if k < 2 or k > MAX_PIECES:          # need both kings; skip illegal junk
+            continue
+        row_w = np.full(MAX_PIECES, PAD, np.int16); row_w[:k] = iw
+        row_b = np.full(MAX_PIECES, PAD, np.int16); row_b[:k] = ib
+        fw_l.append(row_w); fb_l.append(row_b)
+        cnt_l.append(k); cp_l.append(cpw)
+        wtm_l.append(b.turn == chess.WHITE)
+    if not fw_l:
+        z = np.zeros((0, MAX_PIECES), np.int16)
+        return z, z, np.zeros(0, np.uint8), np.zeros(0, np.float32), np.zeros(0, np.bool_)
+    return (np.stack(fw_l), np.stack(fb_l),
+            np.array(cnt_l, np.uint8), np.array(cp_l, np.float32), np.array(wtm_l, np.bool_))
 
 
 def main() -> None:
