@@ -1022,17 +1022,27 @@ def _king_danger(units):
 # FT 256/perspective + a PSQT skip: the FT table also carries a per-feature
 # scalar (col 256), so acc[256] accumulates  sum(w_psqt[active])  and the
 # final eval is  (acc_stm[256] - acc_opp[256]) + nn_head(acc[:256]).
+# The FT table stays int16 (12.6MB, ~cache-resident on king-move rebuilds -
+# float32 was 25MB and cost ~3x per row lookup). The accumulator sums int16
+# rows as int32; all scaling happens once per eval in nnue_from_acc. Col 256
+# is the PSQT skip, quantised at its own scale.
 _NNUE_FEATURES = 32 * 768   # 24576
 _NNUE_L1 = 32
 _NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
 NNUE_OK = False
 try:
     _nz = np.load(_NNUE_PATH)
-    _wft = _nz["w_ft"].astype(np.float32) / float(_nz["ft_scale"])   # [24576,256] model units
-    _wpsqt = _nz["w_psqt"].astype(np.float32).reshape(-1, 1)         # [24576,1]
-    NNUE_W_FT = np.ascontiguousarray(np.hstack([_wft, _wpsqt]))      # [24576,257]
-    NNUE_B_FT = np.zeros(257, np.float32)
-    NNUE_B_FT[:256] = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)
+    _ftq = np.ascontiguousarray(_nz["w_ft"], dtype=np.int16)        # [24576,256]
+    _ft_scale = float(_nz["ft_scale"])
+    _wpsqt = _nz["w_psqt"].astype(np.float64).reshape(-1)           # [24576] model units
+    _psqt_scale = 15000.0 / max(float(np.abs(_wpsqt).max()), 1e-9)
+    _psqtq = np.round(_wpsqt * _psqt_scale).astype(np.int16).reshape(-1, 1)
+    NNUE_W_FT = np.ascontiguousarray(np.hstack([_ftq, _psqtq]))     # int16 [24576,257]
+    _bft = np.ascontiguousarray(_nz["b_ft"], dtype=np.float64)
+    NNUE_ACC_BASE = np.zeros(257, np.int32)
+    NNUE_ACC_BASE[:256] = np.round(_bft * _ft_scale).astype(np.int32)  # ft bias folded in
+    NNUE_INV_FT = np.float32(1.0 / _ft_scale)
+    NNUE_INV_PSQT = np.float32(1.0 / _psqt_scale)
     NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,32]
     NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [32]
     NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [32]
@@ -1041,8 +1051,10 @@ try:
     assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
     NNUE_OK = True
 except Exception:
-    NNUE_W_FT = np.zeros((_NNUE_FEATURES, 257), np.float32)
-    NNUE_B_FT = np.zeros(257, np.float32)
+    NNUE_W_FT = np.zeros((_NNUE_FEATURES, 257), np.int16)
+    NNUE_ACC_BASE = np.zeros(257, np.int32)
+    NNUE_INV_FT = np.float32(1.0)
+    NNUE_INV_PSQT = np.float32(1.0)
     NNUE_W_L1 = np.zeros((512, _NNUE_L1), np.float32)
     NNUE_B_L1 = np.zeros(_NNUE_L1, np.float32)
     NNUE_W_L2 = np.zeros(_NNUE_L1, np.float32)
@@ -1071,7 +1083,7 @@ def _rebuild_one(mb, acc, persp, king_sq_persp):
     whenever that perspective's own king moves, since every feature index
     for it is bucketed by king square - an incremental diff can't fix that,
     the whole accumulator is stale."""
-    acc[:] = NNUE_B_FT
+    acc[:] = NNUE_ACC_BASE
     for sq in range(64):
         code = mb[sq]
         if code < 0:
@@ -1196,8 +1208,8 @@ def unmake_move_acc(bb, mb, gh, ply, acc_w, acc_b):
 def nnue_eval(bb, mb):
     """Full recompute from scratch - reference implementation, used to (re)seed
     the incremental accumulators and to cross-check them in tests."""
-    acc_w = NNUE_B_FT.copy()
-    acc_b = NNUE_B_FT.copy()
+    acc_w = NNUE_ACC_BASE.copy()
+    acc_b = NNUE_ACC_BASE.copy()
     build_acc(bb, mb, acc_w, acc_b)
     return nnue_from_acc(bb, acc_w, acc_b)
 
@@ -1211,17 +1223,19 @@ def nnue_from_acc(bb, acc_w, acc_b):
     a_stm = acc_w if stm == 0 else acc_b
     a_opp = acc_b if stm == 0 else acc_w
 
+    inv = NNUE_INV_FT
     h = np.empty(32, np.float32)
     for k in range(32):
         h[k] = NNUE_B_L1[k]
-    # relu(a)[i] == a[i] when a[i] > 0 else 0 - gate on the raw accumulator.
+    # ft bias is folded into the accumulator base, so a_stm[i]*inv is already
+    # (pre-activation) in model units; relu = gate on > 0.
     for i in range(256):
-        s = a_stm[i]
+        s = np.float32(a_stm[i]) * inv
         if s > 0.0:
             for k in range(32):
                 h[k] += s * NNUE_W_L1[i, k]
     for i in range(256):
-        o = a_opp[i]
+        o = np.float32(a_opp[i]) * inv
         if o > 0.0:
             for k in range(32):
                 h[k] += o * NNUE_W_L1[256 + i, k]
@@ -1230,7 +1244,7 @@ def nnue_from_acc(bb, acc_w, acc_b):
         v = h[i]
         if v > 0.0:
             out += v * NNUE_W_L2[i]
-    out += a_stm[256] - a_opp[256]        # PSQT skip
+    out += np.float32(a_stm[256] - a_opp[256]) * NNUE_INV_PSQT   # PSQT skip
     return I(out * NNUE_SCALE) + 14
 
 
@@ -1712,8 +1726,8 @@ class Engine:
         self.hi = np.zeros((2, 64, 64), np.int32)
         self.mv = np.zeros((MAX_PLY, 256), np.int32)
         self.ct = np.zeros(8, np.int64)
-        self.acc_w = np.zeros(257, np.float32)  # [:256] FT, [256] PSQT skip
-        self.acc_b = np.zeros(257, np.float32)
+        self.acc_w = np.zeros(257, np.int32)  # int16-row sums; [256] = PSQT skip
+        self.acc_b = np.zeros(257, np.int32)
         # warm the JIT (compiles the whole graph)
         bb, mb = fen_to_arrays("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
         build_acc(bb, mb, self.acc_w, self.acc_b)
