@@ -32,8 +32,10 @@ import torch.nn.functional as F
 from nnue.features import N_FEATURES
 
 FT = 256
-L1W = 32
+L1W = 16                            # set from --l1 in main()
 SCALE = 100.0                       # cp = model_output * SCALE
+# model units (cp/SCALE), own-perspective minus opp-perspective, for the PSQT init
+_PIECE_VAL = [1.0, 3.2, 3.3, 5.0, 9.5, 0.0]   # P N B R Q K
 WDL_DIV = 173.72 / SCALE            # model units -> logistic-Elo win prob
 REPO = "github.com/prog-dj/aichessathon-dev.git"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,16 +45,31 @@ LOG = os.path.join(HERE, "train_log.json")
 
 
 class NNUE(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, l1w: int = L1W) -> None:
         super().__init__()
         self.ft = nn.Embedding(N_FEATURES + 1, FT, padding_idx=N_FEATURES)
         self.psqt = nn.Embedding(N_FEATURES + 1, 1, padding_idx=N_FEATURES)
         self.ft_bias = nn.Parameter(torch.zeros(FT))
-        self.l1 = nn.Linear(FT * 2, L1W)
-        self.l2 = nn.Linear(L1W, 1)
+        self.l1 = nn.Linear(FT * 2, l1w)
+        self.l2 = nn.Linear(l1w, 1)
         nn.init.normal_(self.ft.weight, std=0.03)
-        nn.init.zeros_(self.psqt.weight)
+        self._init_psqt()
+
+    def _init_psqt(self) -> None:
+        """Seed the PSQT skip with real piece values so it carries material from
+        step 0 - otherwise the FT/L1 path absorbs material badly and the skip
+        never engages (the failure mode of the L1=32 run: +9cp on a full queen).
+        feat = (pt*2 + (0 own | 1 opp)) * 64 + sq_rel, per king bucket."""
+        import numpy as _np
+        w = _np.zeros(N_FEATURES + 1, _np.float32)
+        for kb in range(32):
+            base = kb * 768
+            for pt, val in enumerate(_PIECE_VAL):
+                for sq in range(64):
+                    w[base + (pt * 2 + 0) * 64 + sq] = val    # own piece
+                    w[base + (pt * 2 + 1) * 64 + sq] = -val   # their piece
         with torch.no_grad():
+            self.psqt.weight.copy_(torch.from_numpy(w).unsqueeze(1))
             self.ft.weight[N_FEATURES].zero_()
             self.psqt.weight[N_FEATURES].zero_()
 
@@ -74,6 +91,7 @@ class NNUE(nn.Module):
 def export(model: NNUE) -> None:
     model.eval()
     sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    l1w = sd["l2.weight"].shape[1]
     w_ft = sd["ft.weight"][:N_FEATURES].numpy().astype(np.float32)
     w_psqt = sd["psqt.weight"][:N_FEATURES].reshape(-1).numpy().astype(np.float32)
     ft_scale = float(32000.0 / max(float(np.abs(w_ft).max()), 1e-6))
@@ -84,16 +102,16 @@ def export(model: NNUE) -> None:
         ft_scale=np.float32(ft_scale),
         w_psqt=w_psqt,                                            # [24576] model units
         b_ft=sd["ft_bias"].numpy().astype(np.float32),            # [256]
-        w_l1=sd["l1.weight"].numpy().T.astype(np.float32),        # [512, 32]
-        b_l1=sd["l1.bias"].numpy().astype(np.float32),            # [32]
-        w_l2=sd["l2.weight"].numpy().reshape(-1).astype(np.float32),  # [32]
+        w_l1=sd["l1.weight"].numpy().T.astype(np.float32),        # [512, l1w]
+        b_l1=sd["l1.bias"].numpy().astype(np.float32),            # [l1w]
+        w_l2=sd["l2.weight"].numpy().reshape(-1).astype(np.float32),  # [l1w]
         b_l2=np.float32(sd["l2.bias"].item()),
         scale=np.float32(SCALE),
-        l1w=np.int32(L1W),
+        l1w=np.int32(l1w),
     )
     z = np.load(OUT)
     assert z["w_ft"].shape == (N_FEATURES, FT) and z["w_ft"].dtype == np.int16
-    assert z["w_l1"].shape == (2 * FT, L1W)
+    assert z["w_l1"].shape == (2 * FT, l1w)
     assert z["w_psqt"].shape == (N_FEATURES,)
 
 
@@ -120,6 +138,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--branch", default="nnue-t4")
     ap.add_argument("--max_lr", type=float, default=3e-3)
+    ap.add_argument("--l1", type=int, default=16)
+    ap.add_argument("--psqt_lr_mult", type=float, default=4.0)
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -153,11 +173,15 @@ def main() -> None:
         y = y_all[rows].to(dev, non_blocking=True)
         return fw, fb, w, y
 
-    model = NNUE().to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model = NNUE(l1w=args.l1).to(dev)
+    psqt_params = list(model.psqt.parameters())
+    rest = [p for n_, p in model.named_parameters() if not n_.startswith("psqt.")]
+    opt = torch.optim.Adam([{"params": rest}, {"params": psqt_params}], lr=1e-3)
     steps = max(1, len(train_idx) // args.batch)
     sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=args.max_lr, epochs=args.epochs, steps_per_epoch=steps)
+        opt, max_lr=[args.max_lr, args.max_lr * args.psqt_lr_mult],
+        epochs=args.epochs, steps_per_epoch=steps)
+    print(f"L1={args.l1}  PSQT seeded with piece values, {args.psqt_lr_mult}x LR")
 
     hist = []
     for ep in range(1, args.epochs + 1):

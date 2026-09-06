@@ -1027,7 +1027,12 @@ def _king_danger(units):
 # rows as int32; all scaling happens once per eval in nnue_from_acc. Col 256
 # is the PSQT skip, quantised at its own scale.
 _NNUE_FEATURES = 32 * 768   # 24576
-_NNUE_L1 = 32
+_NNUE_L1 = 16   # overwritten from the npz below, before the njit funcs compile
+try:
+    _NNUE_L1 = int(np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "weights", "nnue.npz"))["l1w"])
+except Exception:
+    pass
 _NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
 NNUE_OK = False
 try:
@@ -1224,23 +1229,23 @@ def nnue_from_acc(bb, acc_w, acc_b):
     a_opp = acc_b if stm == 0 else acc_w
 
     inv = NNUE_INV_FT
-    h = np.empty(32, np.float32)
-    for k in range(32):
+    h = np.empty(_NNUE_L1, np.float32)
+    for k in range(_NNUE_L1):
         h[k] = NNUE_B_L1[k]
     # ft bias is folded into the accumulator base, so a_stm[i]*inv is already
     # (pre-activation) in model units; relu = gate on > 0.
     for i in range(256):
         s = np.float32(a_stm[i]) * inv
         if s > 0.0:
-            for k in range(32):
+            for k in range(_NNUE_L1):
                 h[k] += s * NNUE_W_L1[i, k]
     for i in range(256):
         o = np.float32(a_opp[i]) * inv
         if o > 0.0:
-            for k in range(32):
+            for k in range(_NNUE_L1):
                 h[k] += o * NNUE_W_L1[256 + i, k]
     out = NNUE_B_L2
-    for i in range(32):
+    for i in range(_NNUE_L1):
         v = h[i]
         if v > 0.0:
             out += v * NNUE_W_L2[i]
