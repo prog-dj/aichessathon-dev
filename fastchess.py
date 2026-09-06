@@ -930,7 +930,6 @@ def evaluate_hce(bb, mb):
     eg = 0
     mob = np.zeros(2, np.int64)
     danger = np.zeros(2, np.int64)
-    katt = np.zeros(2, np.int64)   # distinct pieces attacking each king's ring
 
     for col in range(2):
         sign = 1 if col == 0 else -1
@@ -960,7 +959,6 @@ def evaluate_hce(bb, mb):
                     if rh > 0:
                         w = 2 if pt <= 2 else (3 if pt == 3 else 5)
                         danger[them] += w * rh
-                        katt[them] += 1
         # bishop pair
         if popcount(bb[2] & own) >= 2:
             mg += sign * 25
@@ -992,18 +990,8 @@ def evaluate_hce(bb, mb):
             elif (fmask & own_p) == U(0):
                 mg += sign * 10
 
-    # Shelter only bites when the king is genuinely under attack (>= 2 distinct
-    # attackers). In quiet positions an advanced or missing shield pawn - a
-    # fianchetto, an h3/g3 luft move - costs nothing, which is what an earlier
-    # unconditional version got wrong.
-    dw = danger[0]
-    db = danger[1]
-    if katt[0] >= 2:
-        dw += _shelter_units(bb, lsb(bb[5] & bb[WOCC]), True)
-    if katt[1] >= 2:
-        db += _shelter_units(bb, lsb(bb[5] & bb[BOCC]), False)
-    wd = _king_danger(dw)
-    bd = _king_danger(db)
+    wd = _king_danger(danger[0])
+    bd = _king_danger(danger[1])
     mg += bd - wd
     mg += mob[0] - mob[1]
 
@@ -1012,65 +1000,6 @@ def evaluate_hce(bb, mb):
     score = num // PHASE_MAX if num >= 0 else -((-num) // PHASE_MAX)
     stm = score if I(bb[STM]) == 0 else -score
     return stm + 14
-
-
-_KS_SHIELD = 2   # per rank the nearest shield pawn is from the king (gated: attackers >= 2)
-_KS_KFILE = 3    # king's own file has no friendly pawn
-_KS_FLANK = 3    # a king-flank file fully open, no pawn of either colour
-
-
-@njit(cache=False, inline="always")
-def _msb(x):
-    x = U(x)
-    r = 0
-    if x >= (U(1) << U(32)):
-        x >>= U(32); r += 32
-    if x >= (U(1) << U(16)):
-        x >>= U(16); r += 16
-    if x >= (U(1) << U(8)):
-        x >>= U(8); r += 8
-    if x >= (U(1) << U(4)):
-        x >>= U(4); r += 4
-    if x >= (U(1) << U(2)):
-        x >>= U(2); r += 2
-    if x >= (U(1) << U(1)):
-        r += 1
-    return r
-
-
-@njit(cache=False, inline="always")
-def _shelter_units(bb, ksq, white):
-    """King-shelter danger units: how far the nearest friendly pawn is on each of
-    the three king files, plus open files by the king. Only reached when the king
-    already has >= 2 attackers, so this amplifies a real attack rather than
-    penalising a quiet semi-open king."""
-    kf = ksq & 7
-    kr = ksq >> 3
-    own_p = bb[0] & (bb[WOCC] if white else bb[BOCC])
-    if white:
-        ahead = (~U(0)) << U(8 * (kr + 1)) if kr < 7 else U(0)
-    else:
-        ahead = (U(1) << U(8 * kr)) - U(1)
-    shield = 0
-    flank = 0
-    for df in range(-1, 2):
-        f = kf + df
-        if f < 0 or f > 7:
-            continue
-        fbb = FILE_BB[f]
-        pf = own_p & fbb & ahead
-        if pf == U(0):
-            dist = 4
-        elif white:
-            dist = (lsb(pf) >> 3) - kr
-        else:
-            dist = kr - (_msb(pf) >> 3)
-        d1 = dist - 1
-        shield += d1 if d1 < 3 else 3
-        if (bb[0] & fbb) == U(0):
-            flank += 1
-    kfile_open = 0 if (own_p & FILE_BB[kf]) != U(0) else 1
-    return _KS_SHIELD * shield + _KS_KFILE * kfile_open + _KS_FLANK * flank
 
 
 @njit(cache=False, inline="always")
