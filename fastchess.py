@@ -1056,6 +1056,8 @@ try:
     # decisive band - the search's pruning margins (RFP/futility/razor/SEE) are
     # sized for HCE's spread, so uncalibrated the tree bloats. Scale to match.
     NNUE_SCALE = float(_nz["scale"]) * float(os.environ.get("FC_NNUE_CAL", "1.6"))
+    _NNUE_LAZY = os.environ.get("FC_NNUE_LAZY", "1") == "1"
+    NNUE_LAZY_M = np.int64(int(os.environ.get("FC_NNUE_LAZY_M", "400")))
     assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
     # int16 L1: xs[i] = relu(acc[i]) >> _NNUE_ASHIFT  (int),  weights -> int16,
     # transposed to [L1, 512] so the i-loop is a contiguous int16 dot (numba
@@ -1074,6 +1076,8 @@ except Exception:
     NNUE_W1Q = np.zeros((_NNUE_L1, 512), np.int16)
     NNUE_L1_DEQ = np.float32(1.0)
     _NNUE_ASHIFT = 5
+    _NNUE_LAZY = False
+    NNUE_LAZY_M = np.int64(400)
     NNUE_W_L1 = np.zeros((512, _NNUE_L1), np.float32)
     NNUE_B_L1 = np.zeros(_NNUE_L1, np.float32)
     NNUE_W_L2 = np.zeros(_NNUE_L1, np.float32)
@@ -1237,17 +1241,26 @@ def nnue_eval(bb, mb):
     acc_w = NNUE_ACC_BASE.copy()
     acc_b = NNUE_ACC_BASE.copy()
     build_acc(bb, mb, acc_w, acc_b)
-    return nnue_from_acc(bb, acc_w, acc_b)
+    return nnue_from_acc(bb, acc_w, acc_b, -INF_S, INF_S)
 
 
 @njit(cache=False)
-def nnue_from_acc(bb, acc_w, acc_b):
+def nnue_from_acc(bb, acc_w, acc_b, alpha, beta):
     """Forward pass from already-maintained accumulators - no board walk.
     eval = (psqt_stm - psqt_opp) + nn_head, in model units, then * SCALE -> cp.
-    Explicit scalar loops (numpy row slicing here cost 23x a whole HCE eval)."""
+
+    Lazy: the PSQT column (a_stm[256]-a_opp[256]) is maintained for free and is
+    ~material + coarse king-safety. The L1/L2 head only adds ~+/-NNUE_LAZY_M cp
+    of positional nuance, so if PSQT alone is that far outside the a/b window the
+    network can't change the decision - return PSQT, skip the forward."""
     stm = I(bb[STM])
     a_stm = acc_w if stm == 0 else acc_b
     a_opp = acc_b if stm == 0 else acc_w
+
+    psqt = np.float32(a_stm[256] - a_opp[256]) * NNUE_INV_PSQT
+    psqt_cp = I(psqt * NNUE_SCALE) + 14
+    if _NNUE_LAZY and (psqt_cp + NNUE_LAZY_M < alpha or psqt_cp - NNUE_LAZY_M > beta):
+        return psqt_cp
 
     # int16 activations (relu'd, /32), then per-output an int16 dot over the
     # 512-wide input - numba SIMDs `acc += int32(x[i]) * int32(w[i])` to pmaddwd.
@@ -1269,7 +1282,7 @@ def nnue_from_acc(bb, acc_w, acc_b):
         hk = NNUE_B_L1[k] + np.float32(acc) * NNUE_L1_DEQ
         if hk > 0.0:
             out += hk * NNUE_W_L2[k]
-    out += np.float32(a_stm[256] - a_opp[256]) * NNUE_INV_PSQT   # PSQT skip
+    out += psqt   # PSQT skip
     return I(out * NNUE_SCALE) + 14
 
 
@@ -1279,9 +1292,9 @@ USE_NNUE = NNUE_OK and os.environ.get("FASTCHESS_NNUE", "0") == "1"
 
 
 @njit(cache=False)
-def evaluate(bb, mb, acc_w, acc_b):
+def evaluate(bb, mb, acc_w, acc_b, alpha, beta):
     if USE_NNUE:
-        return nnue_from_acc(bb, acc_w, acc_b)
+        return nnue_from_acc(bb, acc_w, acc_b, alpha, beta)
     return evaluate_hce(bb, mb)
 
 
@@ -1480,7 +1493,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
 
     checked = in_check(bb, mb)
     if not checked:
-        stand = evaluate(bb, mb, acc_w, acc_b)
+        stand = evaluate(bb, mb, acc_w, acc_b, alpha, beta)
         if stand >= beta:
             _tt_put(tt, bb[KEY], np.int32(0), stand, 0, 2)
             return stand
@@ -1489,7 +1502,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     else:
         stand = -INF_S
     if ply >= MAX_PLY - 1:
-        return stand if not checked else evaluate(bb, mb, acc_w, acc_b)
+        return stand if not checked else evaluate(bb, mb, acc_w, acc_b, alpha, beta)
 
     buf = mv[ply]
     n = gen_moves(bb, mb, buf, not checked)
@@ -1550,7 +1563,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     if ply > 0 and _rep_or_50(bb, gh, ct, ply):
         return 0
     if ply >= MAX_PLY - 1:
-        return evaluate(bb, mb, acc_w, acc_b)
+        return evaluate(bb, mb, acc_w, acc_b, alpha, beta)
 
     if alpha < -MATE_S + ply:
         alpha = -MATE_S + ply
@@ -1584,7 +1597,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
             if fl == 3 and s <= alpha:
                 return s
 
-    static = -INF_S if checked else evaluate(bb, mb, acc_w, acc_b)
+    static = -INF_S if checked else evaluate(bb, mb, acc_w, acc_b, alpha, beta)
 
     can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
     if can_rfp and static - 80 * depth >= beta:
