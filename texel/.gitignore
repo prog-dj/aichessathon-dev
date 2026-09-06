@@ -1,0 +1,4 @@
+texel_data*.npz
+tuned_weights.npz
+sample*.txt
+*.arena.out
