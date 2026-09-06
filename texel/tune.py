@@ -21,14 +21,13 @@ from texel.model import W0, KD_CAP
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WPROB_DIV = 173.72
-TUNABLE = ["mat_mg", "mat_eg", "mob", "kdw", "ksw", "kdc", "bp_mg", "bp_eg",
+TUNABLE = ["mat_mg", "mat_eg", "mob", "kdw", "kdc", "bp_mg", "bp_eg",
            "iso_mg", "iso_eg", "dbl_mg", "dbl_eg", "pass_mg", "pass_eg",
            "rook_open", "rook_half", "tempo"]
 # per-weight anchor scale (a "1 sigma" move); reg penalises (dw/scale)^2
 ANCHOR = dict(
     mat_mg=np.array([12, 30, 30, 40, 80.]), mat_eg=np.array([12, 30, 30, 40, 80.]),
     mob=np.array([1.5, 1.5, 1.5, 1.5]), kdw=np.array([1.0, 1.0, 1.5, 2.0]),
-    ksw=np.array([2.0, 3.0, 3.0]),
     kdc=np.array([0.4]), bp_mg=np.array([20.]), bp_eg=np.array([20.]),
     iso_mg=np.array([8.]), iso_eg=np.array([8.]), dbl_mg=np.array([6.]), dbl_eg=np.array([8.]),
     pass_mg=np.array([8, 10, 12, 16, 22, 30.]), pass_eg=np.array([10, 12, 16, 22, 30, 40.]),
@@ -40,8 +39,8 @@ def eval_cp(F, W, pst_mg, pst_eg):
     mg = F["mat"] @ W["mat_mg"] + F["pst_mg"] @ pst_mg
     eg = F["mat"] @ W["mat_eg"] + F["pst_eg"] @ pst_eg
     mg = mg + F["mob"] @ W["mob"]
-    ub = torch.clamp(F["kd"][:, 0:4] @ W["kdw"] + F["ks"][:, 0:3] @ W["ksw"], min=0.0, max=KD_CAP)
-    uw = torch.clamp(F["kd"][:, 4:8] @ W["kdw"] + F["ks"][:, 3:6] @ W["ksw"], min=0.0, max=KD_CAP)
+    ub = torch.clamp(F["kd"][:, 0:4] @ W["kdw"], max=KD_CAP)
+    uw = torch.clamp(F["kd"][:, 4:8] @ W["kdw"], max=KD_CAP)
     mg = mg + (ub * ub - uw * uw) * W["kdc"]
     mg = mg + F["bp"] * W["bp_mg"] + F["iso"] * W["iso_mg"] + F["dbl"] * W["dbl_mg"]
     eg = eg + F["bp"] * W["bp_eg"] + F["iso"] * W["iso_eg"] + F["dbl"] * W["dbl_eg"]
@@ -69,7 +68,7 @@ def main():
     torch.set_num_threads(8)
     d = np.load(npz)
     T = lambda k: torch.tensor(d[k], dtype=torch.float32)
-    F = dict(mat=T("mat"), mob=T("mob"), kd=T("kd"), ks=T("ks"), passed=T("passed"),
+    F = dict(mat=T("mat"), mob=T("mob"), kd=T("kd"), passed=T("passed"),
              pst_mg=T("pst_mg"), pst_eg=T("pst_eg"), phase=T("phase"), wtm=T("wtm"),
              bp=T("bp"), iso=T("iso"), dbl=T("dbl"),
              rook_open=T("rook_open"), rook_half=T("rook_half"))

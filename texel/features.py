@@ -55,51 +55,11 @@ def _passed_mask(sq: int, white: bool) -> int:
 #  rook half : 1 mg                 (w - b)
 #  pst       : 384 mg + 384 eg      (per (piece,sq) white-minus-black occupancy)
 #  tempo     : 1 (post-taper, +1 if white to move else -1)
-#  king safe : 6 raw          (danger-to-black-king: shield_holes kfile_open flank_open;
-#                              then the same three for danger-to-white-king)
 #  phase     : scalar 0..24 (not a weight — the taper interpolant)
 N_MAT = 5
 N_MOB = 4
 N_KD = 8
-N_KS = 6
 N_PST = 384
-
-
-def _king_shelter(b, king_sq, white):
-    """Three shelter numbers for `white`'s king, from the attacker's point of view:
-       shield_score - sum over the king file and its two neighbours of
-                      min(3, dist_to_nearest_friendly_pawn_ahead - 1); 0 when a
-                      pawn sits right in front, 3 when the file has none (0..9)
-       kfile_open   - 1.0 if no friendly pawn anywhere on the king's file
-       flank_open   - how many of those up-to-3 files have no pawn of either
-                      colour (a clean rook highway) (0..3)"""
-    kf = chess.square_file(king_sq)
-    kr = chess.square_rank(king_sq)
-    own_p = b.pieces_mask(chess.PAWN, white)
-    all_p = b.pawns
-    if white:
-        ahead = (~((1 << (8 * (kr + 1))) - 1)) & 0xFFFFFFFFFFFFFFFF if kr < 7 else 0
-    else:
-        ahead = (1 << (8 * kr)) - 1
-    shield = 0.0
-    flank = 0.0
-    for f in (kf - 1, kf, kf + 1):
-        if not 0 <= f <= 7:
-            continue
-        fbb = chess.BB_FILES[f]
-        pf = own_p & fbb & ahead
-        if not pf:
-            dist = 4
-        elif white:
-            dist = ((pf & -pf).bit_length() - 1) // 8 - kr        # lowest ahead pawn
-        else:
-            dist = kr - (pf.bit_length() - 1) // 8                # highest ahead pawn
-        d1 = dist - 1
-        shield += 3.0 if d1 > 3 else float(d1)
-        if not (all_p & fbb):
-            flank += 1
-    kfile_open = 0.0 if (own_p & chess.BB_FILES[kf]) else 1.0
-    return shield, kfile_open, flank
 
 
 def extract(fen: str) -> dict:
@@ -125,11 +85,6 @@ def extract(fen: str) -> dict:
     bk = b.king(chess.BLACK)
     w_ring = int(chess.BB_KING_ATTACKS[bk]) | (1 << bk)   # attacking BLACK king
     b_ring = int(chess.BB_KING_ATTACKS[wk]) | (1 << wk)   # attacking WHITE king
-
-    # king shelter: index 0..2 = danger to the BLACK king, 3..5 = to the WHITE king
-    ks = np.zeros(N_KS, np.float64)
-    ks[0:3] = _king_shelter(b, bk, chess.BLACK)
-    ks[3:6] = _king_shelter(b, wk, chess.WHITE)
 
     for col in (chess.WHITE, chess.BLACK):
         sign = 1.0 if col == chess.WHITE else -1.0
@@ -195,7 +150,7 @@ def extract(fen: str) -> dict:
     return dict(
         phase=float(phase),
         wtm=1.0 if b.turn == chess.WHITE else -1.0,
-        mat=mat, mob=mob, kd=kd, ks=ks,
+        mat=mat, mob=mob, kd=kd,
         bp=bp, iso=iso, dbl=dbl,
         passed=passed_mg,
         rook_open=rook_open, rook_half=rook_half,
