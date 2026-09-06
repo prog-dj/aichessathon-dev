@@ -1009,52 +1009,60 @@ def _king_danger(units):
 
 
 # --- NNUE ------------------------------------------------------------------
-# A king-relative (HalfKA-style) feature-transformer net: 49152 features
-# (own-king-square, piece/colour/square, "own vs their" from each
-# perspective) -> 256 accumulator (shared weights, one pass per perspective)
-# -> concat 512 -> 16 -> 1. Trained offline (see scratchpad/train_nnue.py in
-# dev) on Lichess Stockfish-eval positions and shipped as weights/nnue.npz -
-# not a binary, same category as the .onnx/.pt the rules explicitly allow.
-# Bucketing every feature by that perspective's own king square is what lets
-# the net learn king-relative patterns (shelter, an outpost near the king,
-# an open file toward it) at all - a flat piece-square table structurally
-# cannot represent that. The cost: every feature index for a perspective
-# depends on where that side's king is, so a king move invalidates the
-# whole perspective's accumulator - see _rebuild_one below.
+# A king-relative (HalfKA-style) feature-transformer net: 24576 features
+# (32 king buckets x piece/colour/square/own-or-their) -> 256 accumulator per
+# perspective (shared weights) -> concat 512 -> 32 -> 1, plus a PSQT skip
+# (a per-feature scalar that gives the net material "for free" so the small
+# head only learns positional corrections). Trained offline (nnue/train_t4.py)
+# on Lichess Stockfish-eval positions, shipped as weights/nnue.npz - not a
+# binary, same category as the .onnx/.pt the rules explicitly allow.
+# Every feature index for a perspective depends on that side's king square,
+# so a king move invalidates its whole accumulator - see _rebuild_one.
+# Format (nnue/train_t4.py export): 32 king buckets -> 24576 features.
+# FT 256/perspective + a PSQT skip: the FT table also carries a per-feature
+# scalar (col 256), so acc[256] accumulates  sum(w_psqt[active])  and the
+# final eval is  (acc_stm[256] - acc_opp[256]) + nn_head(acc[:256]).
+_NNUE_FEATURES = 32 * 768   # 24576
+_NNUE_L1 = 32
 _NNUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "nnue.npz")
 NNUE_OK = False
 try:
     _nz = np.load(_NNUE_PATH)
-    NNUE_W_FT = np.ascontiguousarray(_nz["w_ft"], dtype=np.float32)  # [49152,256]
-    NNUE_B_FT = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)  # [256]
-    NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,16]
-    NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [16]
-    NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [16]
+    _wft = _nz["w_ft"].astype(np.float32) / float(_nz["ft_scale"])   # [24576,256] model units
+    _wpsqt = _nz["w_psqt"].astype(np.float32).reshape(-1, 1)         # [24576,1]
+    NNUE_W_FT = np.ascontiguousarray(np.hstack([_wft, _wpsqt]))      # [24576,257]
+    NNUE_B_FT = np.zeros(257, np.float32)
+    NNUE_B_FT[:256] = np.ascontiguousarray(_nz["b_ft"], dtype=np.float32)
+    NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,32]
+    NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [32]
+    NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [32]
     NNUE_B_L2 = float(_nz["b_l2"])
     NNUE_SCALE = float(_nz["scale"])
+    assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
     NNUE_OK = True
 except Exception:
-    NNUE_W_FT = np.zeros((49152, 256), np.float32)
-    NNUE_B_FT = np.zeros(256, np.float32)
-    NNUE_W_L1 = np.zeros((512, 16), np.float32)
-    NNUE_B_L1 = np.zeros(16, np.float32)
-    NNUE_W_L2 = np.zeros(16, np.float32)
+    NNUE_W_FT = np.zeros((_NNUE_FEATURES, 257), np.float32)
+    NNUE_B_FT = np.zeros(257, np.float32)
+    NNUE_W_L1 = np.zeros((512, _NNUE_L1), np.float32)
+    NNUE_B_L1 = np.zeros(_NNUE_L1, np.float32)
+    NNUE_W_L2 = np.zeros(_NNUE_L1, np.float32)
     NNUE_B_L2 = 0.0
     NNUE_SCALE = 100.0
 
 
 @njit(cache=False, inline="always")
 def _ft_feature(code, sq, persp, king_sq_persp):
-    """49152-wide feature index for one piece from perspective `persp`
-    (0/1), bucketed by that perspective's own king square (already
-    perspective-relative, i.e. pre-flipped for persp==1 same as any
-    other square)."""
+    """24576-wide feature index for one piece from perspective `persp` (0/1),
+    bucketed by that perspective's own king square (perspective-relative,
+    pre-flipped for persp==1). 32 buckets: (rank // 2) * 8 + file.
+    Must match nnue/features.py."""
     pt = code % 6
     colour = code // 6
     own = 1 if colour == persp else 0
     sq_rel = sq if persp == 0 else (sq ^ 56)
     flat = (pt * 2 + (1 - own)) * 64 + sq_rel
-    return king_sq_persp * 768 + flat
+    bucket = ((king_sq_persp >> 3) >> 1) * 8 + (king_sq_persp & 7)
+    return bucket * 768 + flat
 
 
 @njit(cache=False, inline="always")
@@ -1197,33 +1205,32 @@ def nnue_eval(bb, mb):
 @njit(cache=False)
 def nnue_from_acc(bb, acc_w, acc_b):
     """Forward pass from already-maintained accumulators - no board walk.
-    Explicit scalar loops (no numpy row slicing/broadcasting in the hot path -
-    that was allocating a temporary 16-wide array on every one of the 256
-    iterations and cost 23x a whole HCE eval)."""
+    eval = (psqt_stm - psqt_opp) + nn_head, in model units, then * SCALE -> cp.
+    Explicit scalar loops (numpy row slicing here cost 23x a whole HCE eval)."""
     stm = I(bb[STM])
     a_stm = acc_w if stm == 0 else acc_b
     a_opp = acc_b if stm == 0 else acc_w
 
-    h = np.empty(16, np.float32)
-    for k in range(16):
+    h = np.empty(32, np.float32)
+    for k in range(32):
         h[k] = NNUE_B_L1[k]
-    # relu(a)[i] == a[i] when a[i] > 0, else contributes nothing - skip the
-    # separate np.maximum pass and just gate on the raw accumulator.
+    # relu(a)[i] == a[i] when a[i] > 0 else 0 - gate on the raw accumulator.
     for i in range(256):
         s = a_stm[i]
         if s > 0.0:
-            for k in range(16):
+            for k in range(32):
                 h[k] += s * NNUE_W_L1[i, k]
     for i in range(256):
         o = a_opp[i]
         if o > 0.0:
-            for k in range(16):
+            for k in range(32):
                 h[k] += o * NNUE_W_L1[256 + i, k]
     out = NNUE_B_L2
-    for i in range(16):
+    for i in range(32):
         v = h[i]
         if v > 0.0:
             out += v * NNUE_W_L2[i]
+    out += a_stm[256] - a_opp[256]        # PSQT skip
     return I(out * NNUE_SCALE) + 14
 
 
@@ -1705,8 +1712,8 @@ class Engine:
         self.hi = np.zeros((2, 64, 64), np.int32)
         self.mv = np.zeros((MAX_PLY, 256), np.int32)
         self.ct = np.zeros(8, np.int64)
-        self.acc_w = np.zeros(256, np.float32)
-        self.acc_b = np.zeros(256, np.float32)
+        self.acc_w = np.zeros(257, np.float32)  # [:256] FT, [256] PSQT skip
+        self.acc_b = np.zeros(257, np.float32)
         # warm the JIT (compiles the whole graph)
         bb, mb = fen_to_arrays("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
         build_acc(bb, mb, self.acc_w, self.acc_b)
