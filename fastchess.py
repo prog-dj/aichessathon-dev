@@ -1229,26 +1229,26 @@ def nnue_from_acc(bb, acc_w, acc_b):
     a_opp = acc_b if stm == 0 else acc_w
 
     inv = NNUE_INV_FT
+    # ft bias is folded into the accumulator base, so acc*inv is the pre-activation
+    # in model units.  No temp arrays: scalar convert + branchless relu, then the
+    # combined FMA over both perspectives so numba SIMDs the inner (k) loop once.
     h = np.empty(_NNUE_L1, np.float32)
     for k in range(_NNUE_L1):
         h[k] = NNUE_B_L1[k]
-    # ft bias is folded into the accumulator base, so a_stm[i]*inv is already
-    # (pre-activation) in model units; relu = gate on > 0.
     for i in range(256):
         s = np.float32(a_stm[i]) * inv
-        if s > 0.0:
-            for k in range(_NNUE_L1):
-                h[k] += s * NNUE_W_L1[i, k]
-    for i in range(256):
+        if s < np.float32(0.0):
+            s = np.float32(0.0)
         o = np.float32(a_opp[i]) * inv
-        if o > 0.0:
-            for k in range(_NNUE_L1):
-                h[k] += o * NNUE_W_L1[256 + i, k]
+        if o < np.float32(0.0):
+            o = np.float32(0.0)
+        for k in range(_NNUE_L1):
+            h[k] += s * NNUE_W_L1[i, k] + o * NNUE_W_L1[256 + i, k]
     out = NNUE_B_L2
-    for i in range(_NNUE_L1):
-        v = h[i]
+    for k in range(_NNUE_L1):
+        v = h[k]
         if v > 0.0:
-            out += v * NNUE_W_L2[i]
+            out += v * NNUE_W_L2[k]
     out += np.float32(a_stm[256] - a_opp[256]) * NNUE_INV_PSQT   # PSQT skip
     return I(out * NNUE_SCALE) + 14
 
