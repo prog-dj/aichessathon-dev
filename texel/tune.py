@@ -135,25 +135,6 @@ def main():
         if ep % 6 == 0 or ep == 1:
             print(f"ep{ep:3d}  val-MSE {vm:.5f}")
 
-    # The metric that actually matters: correlation with SF inside +/-300cp,
-    # where games are decided. Aggregate MSE is dominated by decided positions.
-    with torch.no_grad():
-        cpv = T("cp")[val]
-        e_new = eval_cp(Fva, W, pst_mg, pst_eg)
-        W_start = {k: torch.tensor(v.astype(np.float32)) for k, v in W0.items()}
-        e_old = eval_cp(Fva, W_start,
-                        torch.tensor(fc._MG_PST.astype(np.float32).reshape(-1)),
-                        torch.tensor(fc._EG_PST.astype(np.float32).reshape(-1)))
-
-        def corr(a, b):
-            a = a - a.mean(); b = b - b.mean()
-            return float((a @ b) / (a.norm() * b.norm() + 1e-9))
-        band = cpv.abs() <= 300
-        print(f"\n  corr with SF  ALL      : start {corr(e_old, cpv):.3f} -> tuned {corr(e_new, cpv):.3f}")
-        print(f"  corr with SF  +/-300cp : start {corr(e_old[band], cpv[band]):.3f} -> "
-              f"tuned {corr(e_new[band], cpv[band]):.3f}   <-- the one that matters "
-              f"(n={int(band.sum()):,})")
-
     outw = {k: W[k].detach().numpy() for k in W0}
     if do_pst:
         outw["_pst_mg"] = pst_mg.detach().numpy()
