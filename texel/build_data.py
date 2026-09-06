@@ -17,7 +17,7 @@ SRC_DEFAULT = (r"C:\Users\44783\AppData\Local\Temp\claude"
                r"\c--Users-44783-AI-Chessathon-aichessathon-dev"
                r"\d306b6d4-80d9-4b43-afd3-8bb06cc49ce3\scratchpad\nnue_positions.txt")
 
-_KEYS_VEC = ["mat", "mob", "kd", "passed", "pst_mg", "pst_eg"]
+_KEYS_VEC = ["mat", "mob", "kd", "ks", "passed", "pst_mg", "pst_eg"]
 _KEYS_SCALAR = ["phase", "wtm", "bp", "iso", "dbl", "rook_open", "rook_half"]
 
 

@@ -14,6 +14,7 @@ W0 = dict(
     mat_eg=np.array([94, 281, 297, 512, 936], np.float64),
     mob=np.array([2.2, 2.2, 2.2, 2.2], np.float64),          # per-piece N B R Q
     kdw=np.array([2.0, 2.0, 3.0, 5.0], np.float64),          # ring-hit weight N B R Q
+    ksw=np.array([3.0, 6.0, 5.0], np.float64),               # shelter: dist-score, kfile-open, flank-open
     kdc=np.array([11.0 / 16.0], np.float64),                 # curve coeff (u^2 * kdc)
     bp_mg=np.array([25.0]), bp_eg=np.array([25.0]),
     iso_mg=np.array([-12.0]), iso_eg=np.array([-12.0]),
@@ -40,10 +41,10 @@ def eval_white_cp_np(F: dict, W: dict, pst_mg: np.ndarray, pst_eg: np.ndarray) -
 
     mg = mg + F["mob"] @ W["mob"]
 
-    ub = F["kd"][:, 0:4] @ W["kdw"]
-    uw = F["kd"][:, 4:8] @ W["kdw"]
-    ub = np.minimum(ub, KD_CAP)
-    uw = np.minimum(uw, KD_CAP)
+    ub = F["kd"][:, 0:4] @ W["kdw"] + F["ks"][:, 0:3] @ W["ksw"]
+    uw = F["kd"][:, 4:8] @ W["kdw"] + F["ks"][:, 3:6] @ W["ksw"]
+    ub = np.clip(ub, 0.0, KD_CAP)
+    uw = np.clip(uw, 0.0, KD_CAP)
     mg = mg + (ub * ub - uw * uw) * W["kdc"][0]
 
     mg = mg + F["bp"] * W["bp_mg"][0] + F["iso"] * W["iso_mg"][0] + F["dbl"] * W["dbl_mg"][0]
