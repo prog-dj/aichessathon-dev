@@ -1088,12 +1088,15 @@ def _rebuild_one(mb, acc, persp, king_sq_persp):
     whenever that perspective's own king moves, since every feature index
     for it is bucketed by king square - an incremental diff can't fix that,
     the whole accumulator is stale."""
-    acc[:] = NNUE_ACC_BASE
+    for i in range(257):
+        acc[i] = NNUE_ACC_BASE[i]
     for sq in range(64):
         code = mb[sq]
         if code < 0:
             continue
-        acc += NNUE_W_FT[_ft_feature(code, sq, persp, king_sq_persp)]
+        f = _ft_feature(code, sq, persp, king_sq_persp)
+        for i in range(257):
+            acc[i] += NNUE_W_FT[f, i]
 
 
 @njit(cache=False)
@@ -1112,9 +1115,13 @@ def _apply_diff_one(mb, sq, before, acc, persp, king_sq_persp):
     if after == before:
         return
     if before >= 0:
-        acc -= NNUE_W_FT[_ft_feature(before, sq, persp, king_sq_persp)]
+        f = _ft_feature(before, sq, persp, king_sq_persp)
+        for i in range(257):                     # explicit loop: numba SIMDs this,
+            acc[i] -= NNUE_W_FT[f, i]             # `acc -= W[f]` fell back to scalar
     if after >= 0:
-        acc += NNUE_W_FT[_ft_feature(after, sq, persp, king_sq_persp)]
+        g = _ft_feature(after, sq, persp, king_sq_persp)
+        for i in range(257):
+            acc[i] += NNUE_W_FT[g, i]
 
 
 @njit(cache=False)
