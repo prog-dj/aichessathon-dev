@@ -21,3 +21,9 @@ submission.zip
 /weights/nnue.npz
 dist-wheels/
 games/
+
+texel/selfplay.txt
+texel/selfplay.txt.w*
+texel/selfplay.log
+texel/*_data.npz
+texel/tuned*.npz

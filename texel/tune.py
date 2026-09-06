@@ -1,9 +1,13 @@
-"""Texel tune the eval weights (torch Adam) against Stockfish-eval targets.
+"""Texel tune the eval weights (torch Adam).
 
-  python -m texel.tune [texel_data.npz] [epochs] [--groups g1,g2,..] [--reg R]
+  python -m texel.tune [data.npz] [epochs] [--groups g1,g2,..] [--reg R] [--wdl]
+                       [--bs N] [--pstreg P]   (--pstreg anchors PST when 'pst' in groups)
 
-Target (per position):  R = sigmoid(cp / 173.72)   — SF's win-prob judgment
+Target (per position), default:  R = sigmoid(cp / 173.72)   — SF's win-prob judgment
                           (173.72 = 400 / ln 10, the logistic Elo model)
+With --wdl: R is the game result (1 / 0.5 / 0, white POV) straight from column 2
+  — the real Texel target. A fit to SF evals measured +28% correlation and still
+  played 160 Elo worse; matching an eval is not the same as predicting a win.
 Loss:  mean( (R - sigmoid(K * eval_white_cp))^2 )  +  reg * anchor_penalty
 K is fitted once (1-D) with the frozen starting weights.
 anchor_penalty pulls each weight toward its current value scaled by its
@@ -54,9 +58,11 @@ def eval_cp(F, W, pst_mg, pst_eg):
 def main():
     args = sys.argv[1:]
     npz = args[0] if args and not args[0].startswith("-") else os.path.join(HERE, "texel_data.npz")
+    _flag_vals = {args[i + 1] for i, a in enumerate(args[:-1])
+                  if a in ("--groups", "--reg", "--bs", "--pstreg")}
     epochs = 60
     for a in args:
-        if a.isdigit():
+        if a.isdigit() and a not in _flag_vals:
             epochs = int(a)
     groups = None
     if "--groups" in args:
@@ -64,6 +70,10 @@ def main():
     reg = 0.002
     if "--reg" in args:
         reg = float(args[args.index("--reg") + 1])
+    pstreg = 0.0   # anchor PST toward its fastchess starting values (0 = free)
+    if "--pstreg" in args:
+        pstreg = float(args[args.index("--pstreg") + 1])
+    wdl = "--wdl" in args   # column 2 is a game result (1/0.5/0), not an SF cp
 
     torch.set_num_threads(8)
     d = np.load(npz)
@@ -72,8 +82,9 @@ def main():
              pst_mg=T("pst_mg"), pst_eg=T("pst_eg"), phase=T("phase"), wtm=T("wtm"),
              bp=T("bp"), iso=T("iso"), dbl=T("dbl"),
              rook_open=T("rook_open"), rook_half=T("rook_half"))
-    R = torch.sigmoid(T("cp") / WPROB_DIV)
+    R = T("cp") if wdl else torch.sigmoid(T("cp") / WPROB_DIV)
     n = R.shape[0]
+    print(("game-result (WDL)" if wdl else "SF-eval") + " targets")
     g = torch.Generator().manual_seed(0)
     idx = torch.randperm(n, generator=g)
     nv = n // 20
@@ -113,20 +124,32 @@ def main():
     K = 0.5 * (lo + hi)
     print(f"fitted K={K:.5f}  (eval scale vs SF: {1/K/WPROB_DIV:.2f}x)   start val-MSE {Ek(K):.5f}")
 
+    pst_mg0 = torch.tensor(fc._MG_PST.astype(np.float32).reshape(-1))
+    pst_eg0 = torch.tensor(fc._EG_PST.astype(np.float32).reshape(-1))
     params = [W[k] for k in tune_keys] + ([pst_mg, pst_eg] if do_pst else [])
     opt = torch.optim.Adam(params, lr=0.5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     bs = 262144
+    if "--bs" in args:
+        bs = int(args[args.index("--bs") + 1])
+    bs = min(bs, Rtr.shape[0])
     best = 1e9
     for ep in range(1, epochs + 1):
         perm = torch.randperm(Rtr.shape[0])
-        for i in range(0, perm.shape[0] - bs, bs):
+        for i in range(0, perm.shape[0], bs):
             b = perm[i:i + bs]
+            if b.shape[0] < 64:
+                continue
             opt.zero_grad()
             pred = torch.sigmoid(K * eval_cp({k: v[b] for k, v in Ftr.items()}, W, pst_mg, pst_eg))
             loss = torch.mean((pred - Rtr[b]) ** 2)
             pen = sum(torch.mean(((W[k] - W0t[k]) / ANC[k]) ** 2) for k in tune_keys)
-            (loss + reg * pen).backward()
+            reg_term = reg * pen
+            if do_pst and pstreg > 0.0:
+                reg_term = reg_term + pstreg * (
+                    torch.mean(((pst_mg - pst_mg0) / 12.0) ** 2)
+                    + torch.mean(((pst_eg - pst_eg0) / 12.0) ** 2))
+            (loss + reg_term).backward()
             opt.step()
         sched.step()
         with torch.no_grad():
@@ -135,8 +158,7 @@ def main():
         if ep % 6 == 0 or ep == 1:
             print(f"ep{ep:3d}  val-MSE {vm:.5f}")
 
-    # The metric that actually matters: correlation with SF inside +/-300cp,
-    # where games are decided. Aggregate MSE is dominated by decided positions.
+    # Diagnostic: how well does each eval predict the val target?
     with torch.no_grad():
         cpv = T("cp")[val]
         e_new = eval_cp(Fva, W, pst_mg, pst_eg)
@@ -148,11 +170,26 @@ def main():
         def corr(a, b):
             a = a - a.mean(); b = b - b.mean()
             return float((a @ b) / (a.norm() * b.norm() + 1e-9))
-        band = cpv.abs() <= 300
-        print(f"\n  corr with SF  ALL      : start {corr(e_old, cpv):.3f} -> tuned {corr(e_new, cpv):.3f}")
-        print(f"  corr with SF  +/-300cp : start {corr(e_old[band], cpv[band]):.3f} -> "
-              f"tuned {corr(e_new[band], cpv[band]):.3f}   <-- the one that matters "
-              f"(n={int(band.sum()):,})")
+
+        if wdl:
+            # targets are 1/0.5/0 game results; report win-prob prediction quality
+            p_old = torch.sigmoid(K * e_old)
+            p_new = torch.sigmoid(K * e_new)
+            mse_old = float(torch.mean((p_old - Rva) ** 2))
+            mse_new = float(torch.mean((p_new - Rva) ** 2))
+            dec = cpv != 0.5
+            acc_old = float((((p_old > 0.5) == (Rva > 0.5))[dec]).float().mean())
+            acc_new = float((((p_new > 0.5) == (Rva > 0.5))[dec]).float().mean())
+            print(f"\n  val Brier (WDL)   : start {mse_old:.5f} -> tuned {mse_new:.5f}")
+            print(f"  decisive-pos acc  : start {acc_old:.3f} -> tuned {acc_new:.3f} "
+                  f"(n={int(dec.sum()):,})")
+            print(f"  eval corr w/ result: start {corr(e_old, Rva):.3f} -> tuned {corr(e_new, Rva):.3f}")
+        else:
+            band = cpv.abs() <= 300
+            print(f"\n  corr with SF  ALL      : start {corr(e_old, cpv):.3f} -> tuned {corr(e_new, cpv):.3f}")
+            print(f"  corr with SF  +/-300cp : start {corr(e_old[band], cpv[band]):.3f} -> "
+                  f"tuned {corr(e_new[band], cpv[band]):.3f}   <-- the one that matters "
+                  f"(n={int(band.sum()):,})")
 
     outw = {k: W[k].detach().numpy() for k in W0}
     if do_pst:

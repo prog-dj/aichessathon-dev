@@ -19,7 +19,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-FC = os.path.join(ROOT, "fastchess.py")
+FC = os.environ.get("FC_APPLY_TARGET") or os.path.join(ROOT, "fastchess.py")
 
 
 def fmt_row(vals, per_line=8, indent="  "):
