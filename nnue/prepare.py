@@ -28,20 +28,22 @@ import numpy as np
 from nnue.features import MAX_PIECES, PAD, board_features
 
 EVAL_DB_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
-MIN_DEPTH = 13
+MIN_DEPTH = 18
 CLAMP = 2000
 CHUNK = 100_000
 
 
 def _stream_rows(src: str | None, limit: int):
-    """Yield (fen, cp_white) from the eval DB URL (default) or a local file."""
+    """Yield (fen, cp_white, best_move_uci) from the eval DB or a local file.
+    best_move_uci is the deepest eval's PV first move, "" if unknown - the
+    quiet filter in _process drops positions whose best move is a capture."""
     if src and os.path.exists(src):
         with open(src) as f:
             for i, line in enumerate(f):
                 if i >= limit:
                     return
-                fen, cp = line.rstrip("\n").split("\t")
-                yield fen, float(cp)
+                parts = line.rstrip("\n").split("\t")
+                yield parts[0], float(parts[1]), (parts[2] if len(parts) > 2 else "")
         return
 
     import zstandard
@@ -75,21 +77,35 @@ def _stream_rows(src: str | None, limit: int):
             continue
         if len(fen.split()) == 4:
             fen += " 0 1"
-        yield fen, cpw
+        line_uci = (pvs[0].get("line") or "").split()
+        best_move = line_uci[0] if line_uci else ""
+        yield fen, cpw, best_move
         kept += 1
         if kept >= limit:
             return
 
 
-def _process(rows: list[tuple[str, float]]):
+def _process(rows: list[tuple[str, float, str]]):
     import chess
 
     fw_l, fb_l, cnt_l, cp_l, wtm_l = [], [], [], [], []
-    for fen, cpw in rows:
+    for fen, cpw, best_move in rows:
         try:
             b = chess.Board(fen)
         except ValueError:
             continue
+        # quiet filter (SF's rule): the net is a static eval called at leaves
+        # where qsearch has resolved captures - training on in-check / tactical
+        # positions makes it learn the search's job and pollutes the eval.
+        if b.is_check():
+            continue
+        if best_move:
+            try:
+                mv = chess.Move.from_uci(best_move)
+                if mv.promotion is not None or b.is_capture(mv):
+                    continue
+            except ValueError:
+                pass
         iw, ib = board_features(b)
         k = len(iw)
         if k < 2 or k > MAX_PIECES:          # need both kings; skip illegal junk
@@ -116,16 +132,26 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
 
     t0 = time.time()
-    fw_parts, fb_parts, cnt_parts, cp_parts, wtm_parts = [], [], [], [], []
+    from numpy.lib.format import open_memmap
+    cap = int(args.limit * 1.02)
+    pp = lambda nm: os.path.join(args.out, nm)
+    m_fw = open_memmap(pp("feat_w.npy"), mode="w+", dtype=np.int16, shape=(cap, MAX_PIECES))
+    m_fb = open_memmap(pp("feat_b.npy"), mode="w+", dtype=np.int16, shape=(cap, MAX_PIECES))
+    m_cnt = open_memmap(pp("cnt.npy"), mode="w+", dtype=np.uint8, shape=(cap,))
+    m_cp = open_memmap(pp("cp.npy"), mode="w+", dtype=np.float32, shape=(cap,))
+    m_wtm = open_memmap(pp("wtm.npy"), mode="w+", dtype=np.bool_, shape=(cap,))
     done = 0
 
     def flush(fut):
         nonlocal done
         fw, fb, cnt, cp, wtm = fut.result()
-        fw_parts.append(fw); fb_parts.append(fb); cnt_parts.append(cnt)
-        cp_parts.append(cp); wtm_parts.append(wtm)
-        done += len(cnt)
-        print(f"  {done:,} positions  ({time.time()-t0:.0f}s)", flush=True)
+        k = len(cnt)
+        if k and done + k <= cap:
+            s = slice(done, done + k)
+            m_fw[s] = fw; m_fb[s] = fb; m_cnt[s] = cnt; m_cp[s] = cp; m_wtm[s] = wtm
+            done += k
+        if done % 1_000_000 < CHUNK:
+            print(f"  {done:,} positions  ({time.time()-t0:.0f}s)", flush=True)
 
     from collections import deque
 
@@ -144,16 +170,11 @@ def main() -> None:
         while pending:
             flush(pending.popleft())
 
-    fw = np.concatenate(fw_parts); fb = np.concatenate(fb_parts)
-    cnt = np.concatenate(cnt_parts); cp = np.concatenate(cp_parts)
-    wtm = np.concatenate(wtm_parts)
-    n = len(cnt)
-    np.save(os.path.join(args.out, "feat_w.npy"), fw)
-    np.save(os.path.join(args.out, "feat_b.npy"), fb)
-    np.save(os.path.join(args.out, "cnt.npy"), cnt)
-    np.save(os.path.join(args.out, "cp.npy"), cp)
-    np.save(os.path.join(args.out, "wtm.npy"), wtm)
-    meta = dict(n=int(n), min_depth=MIN_DEPTH, clamp=CLAMP,
+    for m in (m_fw, m_fb, m_cnt, m_cp, m_wtm):
+        m.flush()
+    cp = np.asarray(m_cp[:done])
+    n = done
+    meta = dict(n=int(n), cap=cap, min_depth=MIN_DEPTH, clamp=CLAMP,
                band_frac=float(np.mean(np.abs(cp) <= 300)),
                mean_abs_cp=float(np.mean(np.abs(cp))), seconds=round(time.time() - t0))
     with open(os.path.join(args.out, "meta.json"), "w") as f:

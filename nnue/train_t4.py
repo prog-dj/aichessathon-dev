@@ -35,6 +35,9 @@ FT = 256
 L1W = 16                            # set from --l1 in main()
 SCALE = 100.0                       # cp = model_output * SCALE
 # model units (cp/SCALE), own-perspective minus opp-perspective, for the PSQT init
+# PSQT init = true piece values. With 4x LR it drifted ~2x hot and the L1/L2
+# head learned a big opposing correction (mean |nn_head| ~450cp) which kills
+# lazy eval. Low LR mult keeps PSQT ~= material so the head only refines it.
 _PIECE_VAL = [1.0, 3.2, 3.3, 5.0, 9.5, 0.0]   # P N B R Q K
 WDL_DIV = 173.72 / SCALE            # model units -> logistic-Elo win prob
 REPO = "github.com/prog-dj/aichessathon-dev.git"
@@ -139,18 +142,24 @@ def main() -> None:
     ap.add_argument("--branch", default="nnue-t4")
     ap.add_argument("--max_lr", type=float, default=3e-3)
     ap.add_argument("--l1", type=int, default=16)
-    ap.add_argument("--psqt_lr_mult", type=float, default=4.0)
+    ap.add_argument("--psqt_lr_mult", type=float, default=0.5)
     args = ap.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {dev}  ({torch.cuda.get_device_name(0) if dev == 'cuda' else 'CPU'})")
 
     d = args.data
-    feat_w = np.load(os.path.join(d, "feat_w.npy"))       # int16 [N,32]
-    feat_b = np.load(os.path.join(d, "feat_b.npy"))
-    cp = np.load(os.path.join(d, "cp.npy")).astype(np.float32)
-    wtm = np.load(os.path.join(d, "wtm.npy"))
-    n = len(cp)
+    try:
+        n = int(json.load(open(os.path.join(d, "meta.json")))["n"])
+    except Exception:
+        n = None
+    feat_w = np.load(os.path.join(d, "feat_w.npy"), mmap_mode="r")
+    feat_b = np.load(os.path.join(d, "feat_b.npy"), mmap_mode="r")
+    cp = np.asarray(np.load(os.path.join(d, "cp.npy"), mmap_mode="r")).astype(np.float32)
+    wtm = np.asarray(np.load(os.path.join(d, "wtm.npy"), mmap_mode="r")).copy()
+    if n is None:
+        n = len(cp)
+    feat_w, feat_b, cp, wtm = feat_w[:n], feat_b[:n], cp[:n], wtm[:n]
     cp_sign = np.where(wtm, 1.0, -1.0).astype(np.float32)
     target = (cp * cp_sign / SCALE).astype(np.float32)    # stm-POV, model units
     print(f"{n:,} positions   band(<=300cp) {np.mean(np.abs(cp) <= 300):.1%}")
