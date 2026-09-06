@@ -1563,7 +1563,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     if ply > 0 and _rep_or_50(bb, gh, ct, ply):
         return 0
     if ply >= MAX_PLY - 1:
-        return evaluate(bb, mb, acc_w, acc_b, alpha, beta)
+        return evaluate_hce(bb, mb)
 
     if alpha < -MATE_S + ply:
         alpha = -MATE_S + ply
@@ -1597,7 +1597,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
             if fl == 3 and s <= alpha:
                 return s
 
-    static = -INF_S if checked else evaluate(bb, mb, acc_w, acc_b, alpha, beta)
+    static = -INF_S if checked else evaluate_hce(bb, mb)
 
     can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
     if can_rfp and static - 80 * depth >= beta:
