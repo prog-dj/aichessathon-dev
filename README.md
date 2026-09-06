@@ -32,6 +32,23 @@ uv run python -m harness.play --black baselines/minimax --pgn game.pgn
 uv run python -m harness.arena --opponent ../my-old-version --games 200
 ```
 
+## Benchmarking UCI engines
+
+For paired testing of two external UCI engines, use the separate benchmark runner. It plays each
+opening twice, swaps colours, uses 120 seconds per side with no increment, and appends every game
+to one PGN file:
+
+```
+uv run python -m harness.uci_benchmark \
+    --new "/path/to/Engine_New" \
+    --old "/path/to/Engine_Old" \
+    --openings openings.pgn --pgn benchmark.pgn
+```
+
+Opening files can be FEN/EPD line files or PGN books; PGN games are cut after four plies by
+default. Add `--draw-adjudication` for the optional quiet-position draw rule, or `--resign-cp N`
+for optional material-based resignation adjudication.
+
 Anything your agent writes to stdout or stderr shows up under the result, so `print` debugging
 works. The platform discards it during rated games and shows it in your validation log.
 

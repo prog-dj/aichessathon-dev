@@ -1499,7 +1499,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
         return stand if not checked else evaluate_qsearch(bb, mb, acc_w, acc_b)
 
     buf = mv[ply]
-    n = gen_moves(bb, mb, buf, not checked)
+    n = gen_moves(bb, mb, buf, False)
     if n == 0:
         return -MATE_S + ply if checked else stand
     _order(bb, mb, kl, hi, buf, n, ply, 0)
@@ -1508,16 +1508,37 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     gp = ct[N_GPLY]
     for i in range(n):
         m = buf[i]
-        if not checked and not m_is_promo(m):
+        made = False
+        tactical = m_is_cap(m) or m_is_promo(m)
+        if not checked and not tactical:
+            if USE_NNUE:
+                make_move(bb, mb, gh, gp + ply, m)
+            else:
+                make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
+            gives_check = in_check(bb, mb)
+            if not gives_check:
+                if USE_NNUE:
+                    unmake_move(bb, mb, gh, gp + ply)
+                else:
+                    unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
+                continue
+            made = True
+        if not checked and m_is_cap(m):
             to = m_to(m)
             victim = MG_VAL[mb[to] % 6] if mb[to] >= 0 else 100
             attacker = MG_VAL[mb[m_from(m)] % 6]
             if victim + 90 < attacker and stand + victim + 150 < alpha:
+                if made:
+                    if USE_NNUE:
+                        unmake_move(bb, mb, gh, gp + ply)
+                    else:
+                        unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
                 continue
-        if USE_NNUE:
-            make_move(bb, mb, gh, gp + ply, m)
-        else:
-            make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
+        if not made:
+            if USE_NNUE:
+                make_move(bb, mb, gh, gp + ply, m)
+            else:
+                make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
         s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
         if USE_NNUE:
             unmake_move(bb, mb, gh, gp + ply)
@@ -1630,7 +1651,11 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
         else:
             r = 0
             if depth >= 3 and quiet and (not gives_check) and (not checked):
-                r = 1 + (1 if i >= _LMR_I1 else 0) + (1 if (depth >= _LMR_D2 and i >= _LMR_I2) else 0)
+                r = (
+                    1
+                    + (1 if i >= _LMR_I1 else 0)
+                    + (1 if (depth >= _LMR_D2 and i >= _LMR_I2) else 0)
+                )
                 if is_pv:
                     r -= 1
                 if r < 0:
