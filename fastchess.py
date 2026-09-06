@@ -1055,7 +1055,7 @@ try:
     # the net is trained on SF-eval cp but its output std is ~0.6x HCE's in the
     # decisive band - the search's pruning margins (RFP/futility/razor/SEE) are
     # sized for HCE's spread, so uncalibrated the tree bloats. Scale to match.
-    NNUE_SCALE = float(_nz["scale"]) * float(os.environ.get("FC_NNUE_CAL", "1.6"))
+    NNUE_SCALE = float(_nz["scale"]) * float(os.environ.get("FC_NNUE_CAL", "1.0"))
     _NNUE_LAZY = os.environ.get("FC_NNUE_LAZY", "1") == "1"
     NNUE_LAZY_M = np.int64(int(os.environ.get("FC_NNUE_LAZY_M", "400")))
     assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
