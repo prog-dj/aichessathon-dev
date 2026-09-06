@@ -1,73 +1,17 @@
 {
   "config": {
     "FT": 256,
-    "L1W": 32,
+    "L1W": 16,
     "scale": 100.0
   },
   "history": [
     {
       "epoch": 1,
-      "loss": 0.04669,
-      "val_mae_cp": 362.8,
-      "band_mae_cp": 76.5,
-      "band_r": 0.425,
-      "sec": 40
-    },
-    {
-      "epoch": 2,
-      "loss": 0.03053,
-      "val_mae_cp": 344.8,
-      "band_mae_cp": 75.6,
-      "band_r": 0.471,
-      "sec": 40
-    },
-    {
-      "epoch": 3,
-      "loss": 0.02608,
-      "val_mae_cp": 331.3,
-      "band_mae_cp": 74.2,
-      "band_r": 0.492,
-      "sec": 40
-    },
-    {
-      "epoch": 4,
-      "loss": 0.02278,
-      "val_mae_cp": 321.2,
-      "band_mae_cp": 72.9,
-      "band_r": 0.505,
-      "sec": 40
-    },
-    {
-      "epoch": 5,
-      "loss": 0.02006,
-      "val_mae_cp": 310.7,
-      "band_mae_cp": 72.4,
-      "band_r": 0.517,
-      "sec": 40
-    },
-    {
-      "epoch": 6,
-      "loss": 0.01772,
-      "val_mae_cp": 303.0,
-      "band_mae_cp": 72.5,
-      "band_r": 0.524,
-      "sec": 40
-    },
-    {
-      "epoch": 7,
-      "loss": 0.01595,
-      "val_mae_cp": 297.5,
-      "band_mae_cp": 72.6,
-      "band_r": 0.526,
-      "sec": 40
-    },
-    {
-      "epoch": 8,
-      "loss": 0.01505,
-      "val_mae_cp": 296.2,
-      "band_mae_cp": 72.7,
-      "band_r": 0.527,
-      "sec": 40
+      "loss": 0.04968,
+      "val_mae_cp": 307.1,
+      "band_mae_cp": 103.8,
+      "band_r": 0.301,
+      "sec": 107
     }
   ]
 }
