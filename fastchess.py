@@ -1048,18 +1048,29 @@ try:
     NNUE_ACC_BASE[:256] = np.round(_bft * _ft_scale).astype(np.int32)  # ft bias folded in
     NNUE_INV_FT = np.float32(1.0 / _ft_scale)
     NNUE_INV_PSQT = np.float32(1.0 / _psqt_scale)
-    NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,32]
-    NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [32]
-    NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [32]
+    NNUE_W_L1 = np.ascontiguousarray(_nz["w_l1"], dtype=np.float32)  # [512,L1]
+    NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [L1]
+    NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [L1]
     NNUE_B_L2 = float(_nz["b_l2"])
     NNUE_SCALE = float(_nz["scale"])
     assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
+    # int16 L1: xs[i] = relu(acc[i]) >> _NNUE_ASHIFT  (int),  weights -> int16,
+    # transposed to [L1, 512] so the i-loop is a contiguous int16 dot (numba
+    # SIMDs to pmaddwd).  h_true[k] = b_l1[k] + acc64 * _NNUE_L1_DEQ.
+    _NNUE_ASHIFT = 5
+    _w1s = 8192.0 / max(float(np.abs(_nz["w_l1"]).max()), 1e-9)
+    NNUE_W1Q = np.ascontiguousarray(
+        np.round(_nz["w_l1"].astype(np.float64).T * _w1s).astype(np.int16))  # [L1, 512]
+    NNUE_L1_DEQ = np.float32(1.0 / ((_ft_scale / (1 << _NNUE_ASHIFT)) * _w1s))
     NNUE_OK = True
 except Exception:
     NNUE_W_FT = np.zeros((_NNUE_FEATURES, 257), np.int16)
     NNUE_ACC_BASE = np.zeros(257, np.int32)
     NNUE_INV_FT = np.float32(1.0)
     NNUE_INV_PSQT = np.float32(1.0)
+    NNUE_W1Q = np.zeros((_NNUE_L1, 512), np.int16)
+    NNUE_L1_DEQ = np.float32(1.0)
+    _NNUE_ASHIFT = 5
     NNUE_W_L1 = np.zeros((512, _NNUE_L1), np.float32)
     NNUE_B_L1 = np.zeros(_NNUE_L1, np.float32)
     NNUE_W_L2 = np.zeros(_NNUE_L1, np.float32)
@@ -1235,27 +1246,26 @@ def nnue_from_acc(bb, acc_w, acc_b):
     a_stm = acc_w if stm == 0 else acc_b
     a_opp = acc_b if stm == 0 else acc_w
 
-    inv = NNUE_INV_FT
-    # ft bias is folded into the accumulator base, so acc*inv is the pre-activation
-    # in model units.  No temp arrays: scalar convert + branchless relu, then the
-    # combined FMA over both perspectives so numba SIMDs the inner (k) loop once.
-    h = np.empty(_NNUE_L1, np.float32)
-    for k in range(_NNUE_L1):
-        h[k] = NNUE_B_L1[k]
+    # int16 activations (relu'd, /32), then per-output an int16 dot over the
+    # 512-wide input - numba SIMDs `acc += int32(x[i]) * int32(w[i])` to pmaddwd.
+    xs = np.empty(256, np.int32)
+    xo = np.empty(256, np.int32)
     for i in range(256):
-        s = np.float32(a_stm[i]) * inv
-        if s < np.float32(0.0):
-            s = np.float32(0.0)
-        o = np.float32(a_opp[i]) * inv
-        if o < np.float32(0.0):
-            o = np.float32(0.0)
-        for k in range(_NNUE_L1):
-            h[k] += s * NNUE_W_L1[i, k] + o * NNUE_W_L1[256 + i, k]
+        v = a_stm[i] // 32
+        xs[i] = v if v > 0 else 0
+        v = a_opp[i] // 32
+        xo[i] = v if v > 0 else 0
     out = NNUE_B_L2
     for k in range(_NNUE_L1):
-        v = h[k]
-        if v > 0.0:
-            out += v * NNUE_W_L2[k]
+        wk = NNUE_W1Q[k]
+        acc = np.int64(0)
+        for i in range(256):
+            acc += np.int64(xs[i]) * np.int64(wk[i])
+        for i in range(256):
+            acc += np.int64(xo[i]) * np.int64(wk[256 + i])
+        hk = NNUE_B_L1[k] + np.float32(acc) * NNUE_L1_DEQ
+        if hk > 0.0:
+            out += hk * NNUE_W_L2[k]
     out += np.float32(a_stm[256] - a_opp[256]) * NNUE_INV_PSQT   # PSQT skip
     return I(out * NNUE_SCALE) + 14
 
