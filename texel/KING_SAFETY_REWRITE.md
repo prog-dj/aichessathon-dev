@@ -1,4 +1,60 @@
-# King-safety rewrite — spec for the next session
+# King-safety — ATTEMPTED AND DIAGNOSED (read this before trying again)
+
+## RESULT: the rewrite was built, measured, and abandoned. Root cause found.
+
+The accumulate-linearly / threshold / single-nonlinearity design in this spec was
+implemented in full (attacker weights, ring attacks, safe checks via per-piece
+enemy attack maps, distance-based shelter, no-queen discount, ring defenders).
+It was correct: perft(5) exact, **800/800 colour-symmetry**, and the eval-change
+distribution was healthy (median 11cp, p90 83cp, p99 239cp — versus the failed
+gated attempt's mean 188cp with 781cp cliffs).
+
+It still degraded eval quality. The decisive experiment was an **ablation**,
+measuring correlation with Stockfish on the subset of positions where the term
+actually fires:
+
+| config | delta corr vs fcd8f08 |
+|---|---|
+| att+ring only (**identical inputs to the old term, new curve**) | **-0.051** |
+| + safe checks only | -0.048 |
+| + shelter only | -0.049 |
+| both (full) | -0.025 |
+
+**The control degrades as much as everything else.** The new signals are not the
+problem — they recover half the loss. **Reshaping the curve is what breaks it.**
+
+A 12-point sweep over scale (0.35/0.6/1.0) x threshold (100/250) x divisor
+(400/900) found *no* configuration with a positive delta. Best was -0.025.
+
+## Why: the eval is calibrated *around* the old curve
+`_king_danger(u) = min(u,40)**2 * 11 // 16` maps units 0..40 onto 0..1100cp.
+Every other eval term (PST, material, mobility, pawn structure) has been tuned
+and evolved against that specific king-danger scale. Change the curve's shape and
+the whole eval's internal balance shifts, even with identical inputs. Add signal
+into the old curve and the quadratic amplifies it by hundreds of cp.
+
+**King safety cannot be fixed in isolation on this engine.** It is entangled with
+the rest of the eval's calibration.
+
+## What would actually be required
+Re-tune the ENTIRE eval (material, PST, mobility, pawns, king safety) *jointly*
+with the new king-safety structure. That needs:
+1. A better tuning target than Lichess SF-cp. SF's eval is holistic and depth-
+   informed; tuning against it shrinks king-safety weights to nothing (measured)
+   and the harness only moves val-MSE 0.0526 -> 0.0509. Use **game results from
+   self-play** instead (generate ~100k+ games, label positions by outcome).
+2. PST unfrozen in the tune (768 params) so the eval can rebalance.
+3. Many SPRT rounds.
+That is a multi-day project, not a term-add.
+
+## Score so far: 5 attempts, 0 successes
+pre-session revert; unconditional shelter (-98); Texel-tuned shelter (weights
+collapsed); attacker-gated shelter (W1 D2 L15, ~-250); full rewrite (ablation
+above, not worth an SPRT). The engine's in-band (+/-300cp) correlation with SF is
+**0.177** and none of these moved it.
+
+---
+# Original spec (kept for reference)
 
 ## Goal
 Replace the king-danger term in `fastchess.py:evaluate_hce` with a Stockfish-style
