@@ -122,11 +122,17 @@ def _sync(fen: str) -> chess.Board:
 
 
 def _matches(a: chess.Board, b: chess.Board) -> bool:
+    # `_board.push()` records an en-passant square on every double pawn push, but
+    # a FEN only carries one when an ep capture is actually legal (that is also
+    # what python-chess's own fen() writes). Comparing ep_square directly makes
+    # _sync fail after most double pushes and throw the whole move history away,
+    # which then desyncs _root_fen from the history handed to the engine.
     return (
         a.board_fen() == b.board_fen()
         and a.turn == b.turn
         and a.castling_rights == b.castling_rights
-        and a.ep_square == b.ep_square
+        and a.has_legal_en_passant() == b.has_legal_en_passant()
+        and (not a.has_legal_en_passant() or a.ep_square == b.ep_square)
     )
 
 
@@ -196,16 +202,22 @@ def get_move(fen: str, time_left_ms: int) -> str:
         soft, hard = _budget_ms(
             time_left_ms, board.fullmove_number, _complexity_multiplier(board)
         )
-        chosen = _fast_move(soft, hard) or _fallback_move(board, soft)
+        chosen = _fast_move(soft, hard, legal) or _fallback_move(board, soft)
         if chosen is None:
             chosen = legal[0]
 
     chosen = _tablebase_guard(board, chosen)
+    if chosen not in board.legal_moves:  # never push / return an illegal move -> never forfeit
+        print(f"discarding illegal chosen move {chosen.uci()}")
+        chosen = legal[0]
     board.push(chosen)
-    return chosen.uci()
+    # board.uci() normalises chess960-style castling (e1h1) that the opening
+    # book and some move sources emit into the standard form (e1g1) the
+    # platform's UCI parser expects; a no-op for every other move.
+    return board.uci(chosen)
 
 
-def _fast_move(soft: float, hard: float) -> chess.Move | None:
+def _fast_move(soft: float, hard: float, legal: list[chess.Move]) -> chess.Move | None:
     if _fast is None:
         return None
     try:
@@ -213,7 +225,12 @@ def _fast_move(soft: float, hard: float) -> chess.Move | None:
         uci, _score, _depth, _nodes = _fast.best_move(  # type: ignore[no-untyped-call]
             _root_fen, history, int(soft), int(hard)
         )
-        return chess.Move.from_uci(uci)
+        mv = chess.Move.from_uci(uci)
+        if mv not in legal:  # rare native-search glitch; drop it, reset tables, use the fallback
+            print(f"fastchess returned illegal move {uci}; falling back")
+            _fast.clear()  # type: ignore[no-untyped-call]
+            return None
+        return mv
     except Exception as error:  # never forfeit on an engine bug
         print(f"engine move failed, falling back: {error}")
         return None
