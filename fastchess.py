@@ -1052,7 +1052,10 @@ try:
     NNUE_B_L1 = np.ascontiguousarray(_nz["b_l1"], dtype=np.float32)  # [L1]
     NNUE_W_L2 = np.ascontiguousarray(_nz["w_l2"], dtype=np.float32)  # [L1]
     NNUE_B_L2 = float(_nz["b_l2"])
-    NNUE_SCALE = float(_nz["scale"])
+    # the net is trained on SF-eval cp but its output std is ~0.6x HCE's in the
+    # decisive band - the search's pruning margins (RFP/futility/razor/SEE) are
+    # sized for HCE's spread, so uncalibrated the tree bloats. Scale to match.
+    NNUE_SCALE = float(_nz["scale"]) * float(os.environ.get("FC_NNUE_CAL", "1.6"))
     assert NNUE_W_FT.shape == (_NNUE_FEATURES, 257) and NNUE_W_L1.shape == (512, _NNUE_L1)
     # int16 L1: xs[i] = relu(acc[i]) >> _NNUE_ASHIFT  (int),  weights -> int16,
     # transposed to [L1, 512] so the i-loop is a contiguous int16 dot (numba
