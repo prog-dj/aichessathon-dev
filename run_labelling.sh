@@ -13,8 +13,7 @@ echo "  waiting for the parent to merge its per-worker files..."
 sleep 15
 
 echo "=== combining position files ==="
-cat nnue/sp_batch1.txt nnue/sp_cont_s5.txt nnue/sp_cont3.txt nnue/sp_cont3.txt.w* 2>/dev/null | sort -u > nnue/sp_all.txt || \
-  cat nnue/sp_batch1.txt nnue/sp_cont_s5.txt nnue/sp_cont3.txt 2>/dev/null | sort -u > nnue/sp_all.txt
+cat nnue/sp_batch1.txt nnue/sp_cont_s5.txt nnue/sp_cont3.txt nnue/sp_cont3.txt.w* > nnue/sp_all.txt 2>/dev/null
 wc -l nnue/sp_all.txt
 
 echo "=== Stockfish labelling: $NODES nodes/pos, $WORKERS workers ==="
