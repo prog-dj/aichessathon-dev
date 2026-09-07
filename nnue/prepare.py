@@ -150,8 +150,7 @@ def main() -> None:
             s = slice(done, done + k)
             m_fw[s] = fw; m_fb[s] = fb; m_cnt[s] = cnt; m_cp[s] = cp; m_wtm[s] = wtm
             done += k
-        if done % 1_000_000 < CHUNK:
-            print(f"  {done:,} positions  ({time.time()-t0:.0f}s)", flush=True)
+        print(f"  {done:,} kept  ({time.time()-t0:.0f}s)", flush=True)
 
     from collections import deque
 
