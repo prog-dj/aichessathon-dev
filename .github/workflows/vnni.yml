@@ -1,0 +1,30 @@
+name: vnni-check
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/vnni.yml'
+      - 'scratchpad/vnni_bench.py'
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU identity
+        run: |
+          lscpu | grep -iE 'model name|^flags|architecture' || true
+          echo "--- flags of interest ---"
+          grep -oE 'avx512vnni|avx_vnni|amx_int8|amx_bf16|avx512f|avx512bw|avx2' /proc/cpuinfo | sort -u || echo "(none)"
+      - name: What LLVM sees for codegen
+        run: |
+          pip install -q numba llvmlite numpy
+          python - <<'EOF'
+          import llvmlite.binding as l
+          f = l.get_host_cpu_features()
+          print("host cpu:", l.get_host_cpu_name())
+          for k in ['avx2','avx512f','avx512bw','avx512vl','avx512vnni','avxvnni','amx_int8']:
+              print(f"  {k:12s} {f.get(k, False)}")
+          EOF
+      - name: Run int8 bench if present
+        run: |
+          if [ -f scratchpad/vnni_bench.py ]; then python scratchpad/vnni_bench.py; else echo "(no bench script yet)"; fi
