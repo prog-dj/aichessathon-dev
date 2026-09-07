@@ -59,7 +59,7 @@ def main():
     args = sys.argv[1:]
     npz = args[0] if args and not args[0].startswith("-") else os.path.join(HERE, "texel_data.npz")
     _flag_vals = {args[i + 1] for i, a in enumerate(args[:-1])
-                  if a in ("--groups", "--reg", "--bs", "--pstreg")}
+                  if a in ("--groups", "--reg", "--bs", "--pstreg", "--lambda_r")}
     epochs = 60
     for a in args:
         if a.isdigit() and a not in _flag_vals:
@@ -73,7 +73,10 @@ def main():
     pstreg = 0.0   # anchor PST toward its fastchess starting values (0 = free)
     if "--pstreg" in args:
         pstreg = float(args[args.index("--pstreg") + 1])
-    wdl = "--wdl" in args   # column 2 is a game result (1/0.5/0), not an SF cp
+    wdl = "--wdl" in args   # use the game result (1/0.5/0 white POV) as target
+    lam = 1.0               # --wdl blend: lam*result + (1-lam)*winprob(cp)
+    if "--lambda_r" in args:
+        lam = float(args[args.index("--lambda_r") + 1])
 
     torch.set_num_threads(8)
     d = np.load(npz)
@@ -82,9 +85,15 @@ def main():
              pst_mg=T("pst_mg"), pst_eg=T("pst_eg"), phase=T("phase"), wtm=T("wtm"),
              bp=T("bp"), iso=T("iso"), dbl=T("dbl"),
              rook_open=T("rook_open"), rook_half=T("rook_half"))
-    R = T("cp") if wdl else torch.sigmoid(T("cp") / WPROB_DIV)
+    wp = torch.sigmoid(T("cp") / WPROB_DIV)
+    if wdl:
+        res = T("result") if "result" in d.files else T("cp")   # legacy: result was in 'cp'
+        have = res >= 0.0
+        R = torch.where(have, lam * res + (1.0 - lam) * wp, wp)
+    else:
+        R = wp
     n = R.shape[0]
-    print(("game-result (WDL)" if wdl else "SF-eval") + " targets")
+    print((f"WDL targets (lambda_r={lam})" if wdl else "SF-eval targets"))
     g = torch.Generator().manual_seed(0)
     idx = torch.randperm(n, generator=g)
     nv = n // 20
