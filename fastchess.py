@@ -572,8 +572,9 @@ ZCAST = _zr.randint(0, 1 << 63, size=16, dtype=np.uint64)
 ZEP = _zr.randint(0, 1 << 63, size=8, dtype=np.uint64)
 ZSTM = np.uint64(_zr.randint(0, 1 << 63, dtype=np.uint64))
 
-# undo record: hist[ply, 0..] = move, captured_code(+1, 0=none), castling, ep, halfmove, key
-HIST_W = 6
+# undo record: hist[ply, 0..] = move, captured, castling, ep, halfmove, key,
+#                              moved_piece(0-11 | 12=null), to_sq  -- last two for continuation history
+HIST_W = 8
 
 
 @njit(cache=False, inline="always")
@@ -630,6 +631,8 @@ def make_move(bb, mb, hist, ply, m):
     hist[ply, 3] = bb[EP]
     hist[ply, 4] = bb[HALF]
     hist[ply, 5] = bb[KEY]
+    hist[ply, 6] = moving
+    hist[ply, 7] = to
 
     old_ep = I(bb[EP])
     if old_ep != 64:
@@ -740,6 +743,8 @@ def make_null(bb, hist, ply):
     hist[ply, 3] = bb[EP]
     hist[ply, 4] = bb[HALF]
     hist[ply, 5] = bb[KEY]
+    hist[ply, 6] = 12
+    hist[ply, 7] = 0
     if I(bb[EP]) != 64:
         bb[KEY] ^= ZEP[I(bb[EP]) & 7]
     bb[EP] = U(64)
@@ -1361,11 +1366,32 @@ def _has_np(bb, col):
     return (bb[6 + col] & ~(bb[0] | bb[5])) != U(0)
 
 
+@njit(cache=False, inline="always")
+def _hist_bump(mb, hi, ch, stm, m, p1, t1, p2, t2, b):
+    """Gravity update: t += b - t*|b|/16384, so the table self-limits to +/-16384.
+    b > 0 for the move that caused the cutoff, b < 0 for the quiets that failed."""
+    frm = m_from(m); to_ = m_to(m)
+    ab = b if b >= 0 else -b
+    hv = np.int64(hi[stm, frm, to_])
+    hi[stm, frm, to_] = hv + b - hv * ab // 16384
+    key = mb[frm] * 64 + to_
+    if p1 < 12:
+        c = p1 * 64 + t1
+        cv = np.int64(ch[c, key])
+        ch[c, key] = cv + b - cv * ab // 16384
+    if p2 < 12:
+        c = p2 * 64 + t2
+        cv = np.int64(ch[c, key])
+        ch[c, key] = cv + b - cv * ab // 16384
+
+
 @njit(cache=False)
-def _order(bb, mb, kl, hi, buf, n, ply, tt_move):
+def _order(bb, mb, kl, hi, ch, buf, n, ply, tt_move, p1, t1, p2, t2):
     stm = I(bb[STM])
     k0 = kl[ply, 0]
     k1 = kl[ply, 1]
+    c1 = p1 * 64 + t1 if p1 < 12 else -1
+    c2 = p2 * 64 + t2 if p2 < 12 else -1
     sc = np.empty(n, np.int64)
     for i in range(n):
         m = buf[i]
@@ -1381,7 +1407,13 @@ def _order(bb, mb, kl, hi, buf, n, ply, tt_move):
         elif m == k1:
             v = (1 << 19) - 1
         else:
-            v = hi[stm, m_from(m), m_to(m)]
+            frm = m_from(m); to_ = m_to(m)
+            v = hi[stm, frm, to_]
+            key = mb[frm] * 64 + to_
+            if c1 >= 0:
+                v += ch[c1, key]
+            if c2 >= 0:
+                v += ch[c2, key]
         sc[i] = v
     for i in range(1, n):
         a = sc[i]
@@ -1467,7 +1499,7 @@ def see_gain(bb, mb, m):
 
 
 @njit(cache=False)
-def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
+def _qs(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, ply, alpha, beta):
     ct[N_NODES] += 1
     if ct[N_NODES] >= ct[N_MAXN]:
         ct[N_STOP] = 1
@@ -1508,7 +1540,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
     n = gen_moves(bb, mb, buf, not checked)
     if n == 0:
         return -MATE_S + ply if checked else stand
-    _order(bb, mb, kl, hi, buf, n, ply, qtt_move)
+    _order(bb, mb, kl, hi, ch, buf, n, ply, qtt_move, 12, 0, 12, 0)
 
     best = stand
     best_m = np.int32(0)
@@ -1527,7 +1559,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
             if see_gain(bb, mb, m) < 0:
                 continue
         make_move_acc(bb, mb, gh, gp + ply, m, acc_w, acc_b)
-        s = -_qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
+        s = -_qs(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, ply + 1, -beta, -alpha)
         unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
         if ct[N_STOP] == 1:
             return 0
@@ -1550,7 +1582,7 @@ def _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta):
 
 
 @njit(cache=False)
-def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, is_pv):
+def _nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, is_pv):
     if ct[N_STOP] == 1:
         return 0
     ct[N_NODES] += 1
@@ -1576,7 +1608,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     if checked:
         depth += 1
     if depth <= 0:
-        return _qs(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, ply, alpha, beta)
+        return _qs(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, ply, alpha, beta)
 
     tt_move = np.int32(0)
     ti = _tt_get(tt, bb[KEY])
@@ -1597,6 +1629,11 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
             if fl == 3 and s <= alpha:
                 return s
 
+    # internal iterative reduction: deep node, never searched (no TT move) - the
+    # miss is itself evidence it isn't worth full depth.
+    if depth >= 4 and tt_move == 0 and not checked:
+        depth -= 1
+
     static = -INF_S if checked else evaluate_hce(bb, mb)
 
     can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
@@ -1606,7 +1643,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     if (not is_pv) and (not checked) and depth >= 3 and static >= beta and _has_np(bb, I(bb[STM])):
         r = 3 + depth // 4
         make_null(bb, gh, ct[N_GPLY] + ply)
-        s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+        s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                       depth - r, ply + 1, -beta, -beta + 1, False)
         unmake_null(bb, gh, ct[N_GPLY] + ply)
         if s >= beta and abs(s) < MIMAX:
@@ -1616,7 +1653,12 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
     n = gen_moves(bb, mb, buf, False)
     if n == 0:
         return -MATE_S + ply if checked else 0
-    _order(bb, mb, kl, hi, buf, n, ply, tt_move)
+    _cb = ct[N_GPLY] + ply
+    _p1 = I(gh[_cb - 1, 6]) if _cb >= 1 else 12
+    _t1 = I(gh[_cb - 1, 7]) if _cb >= 1 else 0
+    _p2 = I(gh[_cb - 2, 6]) if _cb >= 2 else 12
+    _t2 = I(gh[_cb - 2, 7]) if _cb >= 2 else 0
+    _order(bb, mb, kl, hi, ch, buf, n, ply, tt_move, _p1, _t1, _p2, _t2)
 
     old_alpha = alpha
     best = -INF_S
@@ -1647,7 +1689,7 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
         gives_check = in_check(bb, mb)
         nd = depth - 1
         if i == 0:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+            s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                           nd, ply + 1, -beta, -alpha, is_pv)
         else:
             r = 0
@@ -1657,19 +1699,19 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
                 r = _LMR[dd, mm]
                 if is_pv:
                     r -= 1
-                if hi[stm, m_from(m), m_to(m)] > 600:
+                if hi[stm, m_from(m), m_to(m)] > 4096:
                     r -= 1                       # move with strong history: trust it more
                 if r < 0:
                     r = 0
                 if r > nd - 1:
                     r = nd - 1
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+            s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                           nd - r, ply + 1, -alpha - 1, -alpha, False)
             if s > alpha and r > 0:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                               nd, ply + 1, -alpha - 1, -alpha, False)
             if s > alpha and s < beta:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                               nd, ply + 1, -beta, -alpha, True)
         unmake_move_acc(bb, mb, gh, gp + ply, acc_w, acc_b)
 
@@ -1686,10 +1728,12 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
                         if kl[ply, 0] != m:
                             kl[ply, 1] = kl[ply, 0]
                             kl[ply, 0] = m
-                        hi[stm, m_from(m), m_to(m)] += depth * depth
+                        _bn = 300 * depth
+                        if _bn > 2400:
+                            _bn = 2400
+                        _hist_bump(mb, hi, ch, stm, m, _p1, _t1, _p2, _t2, _bn)
                         for qi in range(nq):
-                            qq = quiets[qi]
-                            hi[stm, m_from(qq), m_to(qq)] -= depth * depth
+                            _hist_bump(mb, hi, ch, stm, quiets[qi], _p1, _t1, _p2, _t2, -_bn)
                     break
         if quiet and nq < 64:
             quiets[nq] = m
@@ -1711,14 +1755,19 @@ def _nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, ply, alpha, beta, i
 
 
 @njit(cache=False)
-def _root(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, alpha, beta):
+def _root(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, depth, alpha, beta):
     buf = mv[0]
     n = gen_moves(bb, mb, buf, False)
     tt_move = np.int32(0)
     ti = _tt_get(tt, bb[KEY])
     if ti >= 0:
         tt_move = np.int32(tt[ti, 1])
-    _order(bb, mb, kl, hi, buf, n, 0, tt_move)
+    _rb = ct[N_GPLY]
+    _rp1 = I(gh[_rb - 1, 6]) if _rb >= 1 else 12
+    _rt1 = I(gh[_rb - 1, 7]) if _rb >= 1 else 0
+    _rp2 = I(gh[_rb - 2, 6]) if _rb >= 2 else 12
+    _rt2 = I(gh[_rb - 2, 7]) if _rb >= 2 else 0
+    _order(bb, mb, kl, hi, ch, buf, n, 0, tt_move, _rp1, _rt1, _rp2, _rt2)
 
     best = -INF_S
     best_move = buf[0]
@@ -1728,13 +1777,13 @@ def _root(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, depth, alpha, beta):
         m = buf[i]
         make_move_acc(bb, mb, gh, gp, m, acc_w, acc_b)
         if i == 0:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+            s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                           depth - 1, 1, -beta, -a, True)
         else:
-            s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+            s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                           depth - 1, 1, -a - 1, -a, False)
             if s > a and s < beta:
-                s = -_nm(bb, mb, tt, gh, kl, hi, mv, ct, acc_w, acc_b, 
+                s = -_nm(bb, mb, tt, gh, kl, hi, ch, mv, ct, acc_w, acc_b, 
                               depth - 1, 1, -beta, -a, True)
         unmake_move_acc(bb, mb, gh, gp, acc_w, acc_b)
         if ct[N_STOP] == 1:
@@ -1762,6 +1811,7 @@ class Engine:
         self.gh = np.zeros((MAX_PLY + 1024, HIST_W), np.uint64)
         self.kl = np.zeros((MAX_PLY, 2), np.int32)
         self.hi = np.zeros((2, 64, 64), np.int32)
+        self.ch = np.zeros((768, 768), np.int16)   # continuation history [prevpc*64+prevto][pc*64+to]
         self.mv = np.zeros((MAX_PLY, 256), np.int32)
         self.ct = np.zeros(8, np.int64)
         self.acc_w = np.zeros(257, np.int32)  # int16-row sums; [256] = PSQT skip
@@ -1771,7 +1821,7 @@ class Engine:
         build_acc(bb, mb, self.acc_w, self.acc_b)
         self.ct[N_MAXN] = 30_000
         self.ct[:] = [0, 0, 30_000, 0, 0, 0, 0, 0]
-        _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.mv, self.ct,
+        _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.ch, self.mv, self.ct,
               self.acc_w, self.acc_b, 4, -INF, INF)
         self.clear()
 
@@ -1790,6 +1840,7 @@ class Engine:
         # the table. Killers are ply-indexed and churn fast, so still cleared.
         self.kl[:, :] = 0
         self.hi >>= np.int32(1)
+        self.ch >>= np.int16(1)
         self.ct[:] = 0
         self.ct[N_GPLY] = gp
 
@@ -1820,7 +1871,7 @@ class Engine:
                 alpha = max(-INF, score - delta)
                 beta = min(INF, score + delta)
                 while True:
-                    mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
+                    mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.ch,
                                     self.mv, self.ct, self.acc_w, self.acc_b,
                                     depth, alpha, beta)
                     if self.ct[N_STOP] == 1:
@@ -1834,7 +1885,7 @@ class Engine:
                         break
                     delta += delta // 2
             else:
-                mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi,
+                mvv, sc = _root(bb, mb, self.tt, self.gh, self.kl, self.hi, self.ch,
                                 self.mv, self.ct, self.acc_w, self.acc_b,
                                 depth, -INF, INF)
 
