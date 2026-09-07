@@ -21,7 +21,7 @@ def fc_eval_white(fen):
 
 
 def stack(feats):
-    keys = ["mat", "mob", "kd", "passed", "pst_mg", "pst_eg"]
+    keys = ["mat", "mob", "kd", "ks", "passed", "pst_mg", "pst_eg"]
     F = {k: np.stack([f[k] for f in feats]) for k in keys}
     for k in ["phase", "wtm", "bp", "iso", "dbl", "rook_open", "rook_half"]:
         F[k] = np.array([f[k] for f in feats], np.float64)

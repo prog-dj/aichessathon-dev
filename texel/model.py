@@ -15,6 +15,7 @@ W0 = dict(
     mob=np.array([2.2, 2.2, 2.2, 2.2], np.float64),          # per-piece N B R Q
     kdw=np.array([2.0, 2.0, 3.0, 5.0], np.float64),          # ring-hit weight N B R Q
     kdc=np.array([11.0 / 16.0], np.float64),                 # curve coeff (u^2 * kdc)
+    ksw=np.array([0.0, 0.0], np.float64),                    # danger units: [weak-square, safe-check]; 0.0 == current eval
     bp_mg=np.array([25.0]), bp_eg=np.array([25.0]),
     iso_mg=np.array([-12.0]), iso_eg=np.array([-12.0]),
     dbl_mg=np.array([-5.0]), dbl_eg=np.array([-10.0]),
@@ -40,8 +41,9 @@ def eval_white_cp_np(F: dict, W: dict, pst_mg: np.ndarray, pst_eg: np.ndarray) -
 
     mg = mg + F["mob"] @ W["mob"]
 
-    ub = F["kd"][:, 0:4] @ W["kdw"]
-    uw = F["kd"][:, 4:8] @ W["kdw"]
+    # ks = [weak_w, safe_w, weak_b, safe_b]; _w = white attacking the black king
+    ub = F["kd"][:, 0:4] @ W["kdw"] + F["ks"][:, 0] * W["ksw"][0] + F["ks"][:, 1] * W["ksw"][1]
+    uw = F["kd"][:, 4:8] @ W["kdw"] + F["ks"][:, 2] * W["ksw"][0] + F["ks"][:, 3] * W["ksw"][1]
     ub = np.minimum(ub, KD_CAP)
     uw = np.minimum(uw, KD_CAP)
     mg = mg + (ub * ub - uw * uw) * W["kdc"][0]

@@ -935,6 +935,13 @@ INF = MATE + 1
 _PASS_MG = np.array([0, 6, 12, 17, 35, 63, 104, 0], np.int64)  # Texel x1.15
 _PASS_EG = np.array([0, 12, 21, 35, 63, 109, 184, 0], np.int64)
 
+# king-safety danger units per weak square / safe check (Texel-tuned, rounded to
+# int; 0 == the eval before this feature - evaluate_hce stays byte-identical
+# until apply.py patches these). Frozen at @njit compile from the module value.
+_KSW_WEAK = int(os.environ.get("FC_KSW_WEAK", "0"))
+_KSW_SAFE = int(os.environ.get("FC_KSW_SAFE", "0"))
+_KS_ON = _KSW_WEAK != 0 or _KSW_SAFE != 0   # numba folds this constant -> zero cost when off
+
 
 @njit(cache=False)
 def evaluate_hce(bb, mb):
@@ -949,6 +956,10 @@ def evaluate_hce(bb, mb):
     eg = 0
     mob = np.zeros(2, np.int64)
     danger = np.zeros(2, np.int64)
+    atk_all = np.zeros(2, np.uint64)      # per-colour aggregate attacks (pre own-mask)
+    atk_diag = np.zeros(2, np.uint64)     # bishops + queens
+    atk_orth = np.zeros(2, np.uint64)     # rooks + queens
+    atk_knight = np.zeros(2, np.uint64)
 
     for col in range(2):
         sign = 1 if col == 0 else -1
@@ -956,6 +967,11 @@ def evaluate_hce(bb, mb):
         ksq_them = lsb(bb[5] & bb[6 + them])
         ring = KING_ATT[ksq_them] | (ONE << U(ksq_them))
         own = bb[6 + col]
+        if _KS_ON:
+            pw = bb[0] & own
+            while pw != U(0):
+                psq = lsb(pw); pw &= pw - ONE
+                atk_all[col] |= PAWN_ATT[col][psq]
         for pt in range(6):
             x = bb[pt] & own
             while x != U(0):
@@ -966,12 +982,23 @@ def evaluate_hce(bb, mb):
                 if 1 <= pt <= 4:
                     if pt == 1:
                         att = KNIGHT_ATT[sq]
+                        if _KS_ON:
+                            atk_knight[col] |= att
                     elif pt == 2:
                         att = bishop_attacks(sq, occ)
+                        if _KS_ON:
+                            atk_diag[col] |= att
                     elif pt == 3:
                         att = rook_attacks(sq, occ)
+                        if _KS_ON:
+                            atk_orth[col] |= att
                     else:
                         att = queen_attacks(sq, occ)
+                        if _KS_ON:
+                            atk_diag[col] |= att
+                            atk_orth[col] |= att
+                    if _KS_ON:
+                        atk_all[col] |= att
                     att &= ~own
                     mob[col] += 22 * popcount(att) // 10  # 2.2, Texel
                     rh = popcount(att & ring)
@@ -1008,6 +1035,23 @@ def evaluate_hce(bb, mb):
                 mg += sign * 22
             elif (fmask & own_p) == U(0):
                 mg += sign * 10
+
+    # weak squares (king-ring, enemy-attacked, undefended) + safe checks
+    # (a checking square an attacker reaches that the defender doesn't cover).
+    # Fed into the same danger accumulator as the ring-hit term; _KSW_* are
+    # Texel-tuned and 0 by default (evaluate_hce unchanged until apply.py).
+    if _KS_ON:
+        for col in range(2):
+            them = 1 - col
+            kt = lsb(bb[5] & bb[6 + them])
+            kr = KING_ATT[kt] | (ONE << U(kt))
+            not_own = ~bb[6 + col]
+            at = atk_all[them]
+            weak = popcount(kr & atk_all[col] & ~at)
+            sn = popcount(KNIGHT_ATT[kt] & atk_knight[col] & not_own & ~at)
+            sd = popcount(bishop_attacks(kt, occ) & atk_diag[col] & not_own & ~at)
+            so = popcount(rook_attacks(kt, occ) & atk_orth[col] & not_own & ~at)
+            danger[them] += _KSW_WEAK * weak + _KSW_SAFE * (sn + sd + so)
 
     wd = _king_danger(danger[0])
     bd = _king_danger(danger[1])

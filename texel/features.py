@@ -26,6 +26,17 @@ for f in range(8):
         m |= _FILE_BB[f + 1]
     _ADJ.append(m)
 
+_PC = chess.popcount
+
+
+def _bishop_from(sq: int, occ: int) -> int:
+    return chess.BB_DIAG_ATTACKS[sq][chess.BB_DIAG_MASKS[sq] & occ]
+
+
+def _rook_from(sq: int, occ: int) -> int:
+    return (chess.BB_RANK_ATTACKS[sq][chess.BB_RANK_MASKS[sq] & occ]
+            | chess.BB_FILE_ATTACKS[sq][chess.BB_FILE_MASKS[sq] & occ])
+
 
 def _passed_mask(sq: int, white: bool) -> int:
     """Squares in front of `sq` on its file and the two adjacent files."""
@@ -59,6 +70,7 @@ def _passed_mask(sq: int, white: bool) -> int:
 N_MAT = 5
 N_MOB = 4
 N_KD = 8
+N_KS = 4          # [weak_w, safe_w, weak_b, safe_b]  (_w = white attacking black king)
 N_PST = 384
 
 
@@ -86,11 +98,23 @@ def extract(fen: str) -> dict:
     w_ring = int(chess.BB_KING_ATTACKS[bk]) | (1 << bk)   # attacking BLACK king
     b_ring = int(chess.BB_KING_ATTACKS[wk]) | (1 << wk)   # attacking WHITE king
 
+    # per-colour aggregate attack sets (pre own-occupancy mask) for weak-square
+    # and safe-check king-safety features
+    a_all = {chess.WHITE: 0, chess.BLACK: 0}
+    a_n = {chess.WHITE: 0, chess.BLACK: 0}
+    a_d = {chess.WHITE: 0, chess.BLACK: 0}   # bishop + queen
+    a_o = {chess.WHITE: 0, chess.BLACK: 0}   # rook + queen
+
     for col in (chess.WHITE, chess.BLACK):
         sign = 1.0 if col == chess.WHITE else -1.0
         own = wocc if col == chess.WHITE else bocc
         ring = w_ring if col == chess.WHITE else b_ring
         kd_base = 0 if col == chess.WHITE else 4
+        x = b.pieces_mask(chess.PAWN, col)
+        while x:
+            sq = (x & -x).bit_length() - 1
+            x &= x - 1
+            a_all[col] |= int(chess.BB_PAWN_ATTACKS[col][sq])
         for pt in range(1, 7):               # PAWN..KING (chess uses 1..6)
             pcs = b.pieces_mask(pt, col)
             x = pcs
@@ -105,11 +129,40 @@ def extract(fen: str) -> dict:
                 pst_mg[p0 * 64 + idx] += sign
                 pst_eg[p0 * 64 + idx] += sign
                 if 1 <= p0 <= 4:              # N B R Q
-                    att = int(b.attacks_mask(sq)) & ~own
+                    raw = int(b.attacks_mask(sq))
+                    a_all[col] |= raw
+                    if p0 == 1:
+                        a_n[col] |= raw
+                    elif p0 == 2:
+                        a_d[col] |= raw
+                    elif p0 == 3:
+                        a_o[col] |= raw
+                    else:
+                        a_d[col] |= raw
+                        a_o[col] |= raw
+                    att = raw & ~own
                     pc = chess.popcount(att)
                     mob[p0 - 1] += sign * pc
                     rh = chess.popcount(att & ring)
                     kd[kd_base + (p0 - 1)] += rh
+
+    # weak squares (king-ring, attacked by enemy, undefended) + safe checks
+    # (checking square an enemy piece reaches that we don't defend). ks =
+    # [weak_w, safe_w, weak_b, safe_b] where _w is WHITE attacking the black king.
+    ks = np.zeros(4, np.float64)
+    for col in (chess.WHITE, chess.BLACK):
+        them = not col
+        ek = bk if col == chess.WHITE else wk
+        own_c = wocc if col == chess.WHITE else bocc
+        ac, at = a_all[col], a_all[them]
+        ering = int(chess.BB_KING_ATTACKS[ek]) | (1 << ek)
+        weak = _PC(ering & ac & ~at)
+        nchk = _PC(int(chess.BB_KNIGHT_ATTACKS[ek]) & a_n[col] & ~own_c & ~at)
+        bchk = _PC(_bishop_from(ek, occ) & a_d[col] & ~own_c & ~at)
+        rchk = _PC(_rook_from(ek, occ) & a_o[col] & ~own_c & ~at)
+        base = 0 if col == chess.WHITE else 2
+        ks[base] = weak
+        ks[base + 1] = nchk + bchk + rchk
 
     # bishop pair
     bp = (1.0 if chess.popcount(b.pieces_mask(chess.BISHOP, chess.WHITE)) >= 2 else 0.0) \
@@ -150,7 +203,7 @@ def extract(fen: str) -> dict:
     return dict(
         phase=float(phase),
         wtm=1.0 if b.turn == chess.WHITE else -1.0,
-        mat=mat, mob=mob, kd=kd,
+        mat=mat, mob=mob, kd=kd, ks=ks,
         bp=bp, iso=iso, dbl=dbl,
         passed=passed_mg,
         rook_open=rook_open, rook_half=rook_half,
