@@ -28,20 +28,26 @@ import numpy as np
 from nnue.features import MAX_PIECES, PAD, board_features
 
 EVAL_DB_URL = "https://database.lichess.org/lichess_db_eval.jsonl.zst"
-MIN_DEPTH = 13
+MIN_DEPTH = 18
 CLAMP = 2000
 CHUNK = 100_000
 
 
-def _stream_rows(src: str | None, limit: int):
-    """Yield (fen, cp_white) from the eval DB URL (default) or a local file."""
+def _stream_rows(src: str | None, limit: int, selfplay: bool = False):
+    """Yield (fen, cp_white, best_move_uci, result) from the eval DB or a local
+    file. result is -1.0 for the DB (no game outcome). For --selfplay the local
+    file is  fen<TAB>result<TAB>cp_white  (nnue.selfplay output) and rows are
+    already quiet-filtered, so best_move_uci is "" and _process skips that check."""
     if src and os.path.exists(src):
         with open(src) as f:
             for i, line in enumerate(f):
                 if i >= limit:
                     return
-                fen, cp = line.rstrip("\n").split("\t")
-                yield fen, float(cp)
+                parts = line.rstrip("\n").split("\t")
+                if selfplay:
+                    yield parts[0], float(parts[2]), "", float(parts[1])
+                else:
+                    yield parts[0], float(parts[1]), (parts[2] if len(parts) > 2 else ""), -1.0
         return
 
     import zstandard
@@ -75,21 +81,36 @@ def _stream_rows(src: str | None, limit: int):
             continue
         if len(fen.split()) == 4:
             fen += " 0 1"
-        yield fen, cpw
+        line_uci = (pvs[0].get("line") or "").split()
+        best_move = line_uci[0] if line_uci else ""
+        yield fen, cpw, best_move, -1.0
         kept += 1
         if kept >= limit:
             return
 
 
-def _process(rows: list[tuple[str, float]]):
+def _process(rows: list[tuple[str, float, str, float]]):
     import chess
 
-    fw_l, fb_l, cnt_l, cp_l, wtm_l = [], [], [], [], []
-    for fen, cpw in rows:
+    fw_l, fb_l, cnt_l, cp_l, wtm_l, res_l = [], [], [], [], [], []
+    for fen, cpw, best_move, result in rows:
         try:
             b = chess.Board(fen)
         except ValueError:
             continue
+        # quiet filter (SF's rule): the net is a static eval called at leaves
+        # where qsearch has resolved captures - training on in-check / tactical
+        # positions makes it learn the search's job and pollutes the eval.
+        # (--selfplay rows are already filtered at generation, best_move is "".)
+        if b.is_check():
+            continue
+        if best_move:
+            try:
+                mv = chess.Move.from_uci(best_move)
+                if mv.promotion is not None or b.is_capture(mv):
+                    continue
+            except ValueError:
+                pass
         iw, ib = board_features(b)
         k = len(iw)
         if k < 2 or k > MAX_PIECES:          # need both kings; skip illegal junk
@@ -99,11 +120,14 @@ def _process(rows: list[tuple[str, float]]):
         fw_l.append(row_w); fb_l.append(row_b)
         cnt_l.append(k); cp_l.append(cpw)
         wtm_l.append(b.turn == chess.WHITE)
+        res_l.append(result)
     if not fw_l:
         z = np.zeros((0, MAX_PIECES), np.int16)
-        return z, z, np.zeros(0, np.uint8), np.zeros(0, np.float32), np.zeros(0, np.bool_)
+        return (z, z, np.zeros(0, np.uint8), np.zeros(0, np.float32),
+                np.zeros(0, np.bool_), np.zeros(0, np.float32))
     return (np.stack(fw_l), np.stack(fb_l),
-            np.array(cnt_l, np.uint8), np.array(cp_l, np.float32), np.array(wtm_l, np.bool_))
+            np.array(cnt_l, np.uint8), np.array(cp_l, np.float32),
+            np.array(wtm_l, np.bool_), np.array(res_l, np.float32))
 
 
 def main() -> None:
@@ -111,28 +135,41 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=12_000_000)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
-    ap.add_argument("--src", default=None, help="local fen<TAB>cp file (skips download)")
+    ap.add_argument("--src", default=None, help="local file (skips download)")
+    ap.add_argument("--selfplay", action="store_true",
+                    help="--src is nnue.selfplay output: fen<TAB>result<TAB>cp_white, pre-filtered")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     t0 = time.time()
-    fw_parts, fb_parts, cnt_parts, cp_parts, wtm_parts = [], [], [], [], []
+    from numpy.lib.format import open_memmap
+    cap = int(args.limit * 1.02)
+    pp = lambda nm: os.path.join(args.out, nm)
+    m_fw = open_memmap(pp("feat_w.npy"), mode="w+", dtype=np.int16, shape=(cap, MAX_PIECES))
+    m_fb = open_memmap(pp("feat_b.npy"), mode="w+", dtype=np.int16, shape=(cap, MAX_PIECES))
+    m_cnt = open_memmap(pp("cnt.npy"), mode="w+", dtype=np.uint8, shape=(cap,))
+    m_cp = open_memmap(pp("cp.npy"), mode="w+", dtype=np.float32, shape=(cap,))
+    m_wtm = open_memmap(pp("wtm.npy"), mode="w+", dtype=np.bool_, shape=(cap,))
+    m_res = open_memmap(pp("result.npy"), mode="w+", dtype=np.float32, shape=(cap,))
     done = 0
 
     def flush(fut):
         nonlocal done
-        fw, fb, cnt, cp, wtm = fut.result()
-        fw_parts.append(fw); fb_parts.append(fb); cnt_parts.append(cnt)
-        cp_parts.append(cp); wtm_parts.append(wtm)
-        done += len(cnt)
-        print(f"  {done:,} positions  ({time.time()-t0:.0f}s)", flush=True)
+        fw, fb, cnt, cp, wtm, res = fut.result()
+        k = len(cnt)
+        if k and done + k <= cap:
+            s = slice(done, done + k)
+            m_fw[s] = fw; m_fb[s] = fb; m_cnt[s] = cnt
+            m_cp[s] = cp; m_wtm[s] = wtm; m_res[s] = res
+            done += k
+        print(f"  {done:,} kept  ({time.time()-t0:.0f}s)", flush=True)
 
     from collections import deque
 
-    chunk: list[tuple[str, float]] = []
+    chunk: list = []
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         pending: deque = deque()
-        for row in _stream_rows(args.src, args.limit):
+        for row in _stream_rows(args.src, args.limit, args.selfplay):
             chunk.append(row)
             if len(chunk) >= CHUNK:
                 pending.append(ex.submit(_process, chunk))
@@ -144,18 +181,17 @@ def main() -> None:
         while pending:
             flush(pending.popleft())
 
-    fw = np.concatenate(fw_parts); fb = np.concatenate(fb_parts)
-    cnt = np.concatenate(cnt_parts); cp = np.concatenate(cp_parts)
-    wtm = np.concatenate(wtm_parts)
-    n = len(cnt)
-    np.save(os.path.join(args.out, "feat_w.npy"), fw)
-    np.save(os.path.join(args.out, "feat_b.npy"), fb)
-    np.save(os.path.join(args.out, "cnt.npy"), cnt)
-    np.save(os.path.join(args.out, "cp.npy"), cp)
-    np.save(os.path.join(args.out, "wtm.npy"), wtm)
-    meta = dict(n=int(n), min_depth=MIN_DEPTH, clamp=CLAMP,
+    for m in (m_fw, m_fb, m_cnt, m_cp, m_wtm, m_res):
+        m.flush()
+    cp = np.asarray(m_cp[:done])
+    res = np.asarray(m_res[:done])
+    n = done
+    meta = dict(n=int(n), cap=cap, selfplay=bool(args.selfplay),
+               min_depth=MIN_DEPTH, clamp=CLAMP,
                band_frac=float(np.mean(np.abs(cp) <= 300)),
-               mean_abs_cp=float(np.mean(np.abs(cp))), seconds=round(time.time() - t0))
+               mean_abs_cp=float(np.mean(np.abs(cp))),
+               result_mean=float(np.mean(res[res >= 0])) if np.any(res >= 0) else -1.0,
+               seconds=round(time.time() - t0))
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(f"\nsaved {n:,} positions to {args.out}  ({meta})")
