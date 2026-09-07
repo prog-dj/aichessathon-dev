@@ -125,7 +125,7 @@ def worker(wid: int, n_games: int, out_path: str, nodes: int, seed: int,
             fh.write(f"{fen}\t{res}\t{cp}\n")
             kept += 1
         games_done += 1
-        if games_done % 200 == 0:
+        if games_done % 50 == 0:
             fh.flush()
             el = time.time() - t0
             print(f"  w{wid}: {games_done} games  {kept:,} pos  "
