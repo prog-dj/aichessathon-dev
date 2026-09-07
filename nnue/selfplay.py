@@ -30,7 +30,7 @@ _OPEN_CANDIDATES = [
     os.path.join(ROOT, "openings.txt"),
 ]
 
-SAMPLE_EVERY = 5
+SAMPLE_EVERY = 3
 SKIP_PLIES = 8
 MAX_FULLMOVES = 160
 CLAMP_CP = 2000
