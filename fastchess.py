@@ -1652,7 +1652,7 @@ def _nm(bb, mb, tt, gh, kl, hi, ch, corr, mv, ct, acc_w, acc_b, depth, ply, alph
     _stm = I(bb[STM])
     _sck = I(bb[15]) & 16383
     _cv = np.int64(corr[_stm, _sck]) if not checked else np.int64(0)
-    static_c = static + _cv // 32          # HCE static shifted by learned pawn-structure bias
+    static_c = static + _cv // 256         # _cv is 256*error at steady state -> //256 recovers cp
 
     can_rfp = (not is_pv) and (not checked) and depth <= 6 and abs(beta) < MIMAX
     if can_rfp and static_c - 80 * depth >= beta:
@@ -1770,10 +1770,10 @@ def _nm(bb, mb, tt, gh, kl, hi, ch, corr, mv, ct, acc_w, acc_b, depth, ply, alph
         _diff = (best - static) * 256
         _w = depth + 1 if depth < 15 else 16
         _nc = (_cv * (256 - _w) + _diff * _w) // 256
-        if _nc > 8192:
-            _nc = 8192
-        elif _nc < -8192:
-            _nc = -8192
+        if _nc > 16384:
+            _nc = 16384
+        elif _nc < -16384:
+            _nc = -16384
         corr[_stm, _sck] = _nc
 
     ss = best
