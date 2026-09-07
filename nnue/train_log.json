@@ -60,6 +60,14 @@
       "band_mae_cp": 68.7,
       "band_r": 0.574,
       "sec": 74
+    },
+    {
+      "epoch": 8,
+      "loss": 0.01651,
+      "val_mae_cp": 257.1,
+      "band_mae_cp": 67.3,
+      "band_r": 0.577,
+      "sec": 74
     }
   ]
 }
