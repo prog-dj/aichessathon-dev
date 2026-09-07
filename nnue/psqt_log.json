@@ -1,0 +1,16 @@
+{
+  "config": {
+    "model": "psqt-linear",
+    "scale": 100.0
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 0.04315,
+      "val_mae_cp": 309.7,
+      "band_mae_cp": 80.8,
+      "band_r": 0.359,
+      "sec": 22
+    }
+  ]
+}
