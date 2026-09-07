@@ -4,8 +4,11 @@ set -e
 cd "$(dirname "$0")"
 PY="C:/Users/44783/AppData/Local/Programs/Python/Python312/python.exe"
 SF="./stockfish/stockfish-windows-x86-64-universal.exe"
-NODES=15000
-WORKERS=8
+# ~7M positions in <6h. Timed at 71 pos/s/worker @ 10k nodes even under load;
+# 12k on the free machine -> ~4-5h for 7M. sflabel flushes every 2000/worker so
+# a partial run is fully usable if you cut it early.
+NODES=12000
+WORKERS=10
 
 echo "=== stopping self-play ==="
 powershell -c "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { \$_.CommandLine -like '*multiprocessing.spawn*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" || true
