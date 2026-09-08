@@ -31,6 +31,23 @@ import torch.nn.functional as F
 
 from nnue.features import N_FEATURES
 
+# horizontal-mirror permutation of the feature space (file f -> 7-f). A mirrored
+# board is a distinct, equally-valid position with the same eval, so flipping a
+# random half of every batch ~doubles the effective data for free. Feature index
+# = king_bucket*768 + (pt*2+own)*64 + sq_rel; mirroring flips the low 3 bits of
+# both the king bucket and sq_rel.
+def _build_mirror_lut() -> np.ndarray:
+    lut = np.empty(N_FEATURES + 1, np.int64)
+    for i in range(N_FEATURES):
+        kb, flat = divmod(i, 768)
+        ptc, sq = divmod(flat, 64)
+        lut[i] = (kb ^ 7) * 768 + ptc * 64 + (sq ^ 7)
+    lut[N_FEATURES] = N_FEATURES          # PAD -> PAD
+    return lut
+
+
+_MIRROR = _build_mirror_lut()
+
 FT = 256
 L1W = 16                            # set from --l1 in main()
 SCALE = 100.0                       # cp = model_output * SCALE
@@ -192,9 +209,15 @@ def main() -> None:
     wp_all = torch.from_numpy(wp)             # win-prob target - the training loss
     wtm_t = torch.from_numpy(wtm)
 
-    def batch_tensors(rows: np.ndarray):
-        fw = torch.from_numpy(feat_w[rows].astype(np.int64)).to(dev, non_blocking=True)
-        fb = torch.from_numpy(feat_b[rows].astype(np.int64)).to(dev, non_blocking=True)
+    def batch_tensors(rows: np.ndarray, aug: bool = False):
+        fwn = feat_w[rows].astype(np.int64)
+        fbn = feat_b[rows].astype(np.int64)
+        if aug:                                   # mirror a random half of the batch
+            flip = np.random.rand(len(rows)) < 0.5
+            fwn[flip] = _MIRROR[fwn[flip]]
+            fbn[flip] = _MIRROR[fbn[flip]]
+        fw = torch.from_numpy(fwn).to(dev, non_blocking=True)
+        fb = torch.from_numpy(fbn).to(dev, non_blocking=True)
         w = wtm_t[rows].to(dev, non_blocking=True)
         y = wp_all[rows].to(dev, non_blocking=True)
         return fw, fb, w, y
@@ -220,7 +243,7 @@ def main() -> None:
         run_loss = nb = 0
         t = time.time()
         for i in range(0, len(perm) - args.batch, args.batch):
-            fw, fb, w, y = batch_tensors(perm[i:i + args.batch])
+            fw, fb, w, y = batch_tensors(perm[i:i + args.batch], aug=True)
             opt.zero_grad(set_to_none=True)
             pred = model(fw, fb, w)
             loss = F.mse_loss(torch.sigmoid(pred / WDL_DIV), y)   # y is already a win-prob
