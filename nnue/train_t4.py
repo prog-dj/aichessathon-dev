@@ -160,10 +160,13 @@ def main() -> None:
     ap.add_argument("--max_lr", type=float, default=3e-3)
     ap.add_argument("--l1", type=int, default=16)
     ap.add_argument("--psqt_lr_mult", type=float, default=0.5)
-    ap.add_argument("--lambda_cp", type=float, default=0.10,
-                    help="weight of the centipawn-space MSE term added to the WDL loss. "
-                         "Non-zero gives a non-vanishing gradient in the decisive tail "
-                         "where sigmoid(pred) saturates - fixes eval compression.")
+    ap.add_argument("--lambda_cp", type=float, default=0.5,
+                    help="weight of the extended-sigmoid tail term. Same [0,1] scale as "
+                         "the WDL loss but a wider divisor (--cp_div) so it only adds "
+                         "gradient in the decisive tail where the WDL sigmoid saturates.")
+    ap.add_argument("--cp_div", type=float, default=4.0,
+                    help="tail-term sigmoid divisor as a multiple of WDL_DIV. 1 = same as "
+                         "WDL (no effect); 4 keeps gradient out to ~+-3000cp.")
     ap.add_argument("--lambda_r", type=float, default=0.8,
                     help="blend: target = lambda_r*eval_winprob + (1-lambda_r)*game_result "
                          "(only when result.npy is present, i.e. --selfplay data)")
@@ -251,9 +254,11 @@ def main() -> None:
             fw, fb, w, y, ycp = batch_tensors(perm[i:i + args.batch], aug=True)
             opt.zero_grad(set_to_none=True)
             pred = model(fw, fb, w)
-            loss = F.mse_loss(torch.sigmoid(pred / WDL_DIV), y)   # win-prob term
+            loss = F.mse_loss(torch.sigmoid(pred / WDL_DIV), y)   # win-prob term (ordering)
             if args.lambda_cp > 0.0:
-                loss = loss + args.lambda_cp * F.mse_loss(pred, ycp)   # centipawn-space term
+                w2 = WDL_DIV * args.cp_div
+                loss = loss + args.lambda_cp * F.mse_loss(
+                    torch.sigmoid(pred / w2), torch.sigmoid(ycp / w2))   # de-saturates the tail
             loss.backward()
             opt.step()
             sched.step()
