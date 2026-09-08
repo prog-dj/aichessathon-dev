@@ -160,6 +160,10 @@ def main() -> None:
     ap.add_argument("--max_lr", type=float, default=3e-3)
     ap.add_argument("--l1", type=int, default=16)
     ap.add_argument("--psqt_lr_mult", type=float, default=0.5)
+    ap.add_argument("--lambda_cp", type=float, default=0.10,
+                    help="weight of the centipawn-space MSE term added to the WDL loss. "
+                         "Non-zero gives a non-vanishing gradient in the decisive tail "
+                         "where sigmoid(pred) saturates - fixes eval compression.")
     ap.add_argument("--lambda_r", type=float, default=0.8,
                     help="blend: target = lambda_r*eval_winprob + (1-lambda_r)*game_result "
                          "(only when result.npy is present, i.e. --selfplay data)")
@@ -220,7 +224,8 @@ def main() -> None:
         fb = torch.from_numpy(fbn).to(dev, non_blocking=True)
         w = wtm_t[rows].to(dev, non_blocking=True)
         y = wp_all[rows].to(dev, non_blocking=True)
-        return fw, fb, w, y
+        ycp = y_all[rows].to(dev, non_blocking=True)   # cp target, model units, stm POV
+        return fw, fb, w, y, ycp
 
     model = NNUE(l1w=args.l1).to(dev)
     psqt_params = list(model.psqt.parameters())
@@ -243,10 +248,12 @@ def main() -> None:
         run_loss = nb = 0
         t = time.time()
         for i in range(0, len(perm) - args.batch, args.batch):
-            fw, fb, w, y = batch_tensors(perm[i:i + args.batch], aug=True)
+            fw, fb, w, y, ycp = batch_tensors(perm[i:i + args.batch], aug=True)
             opt.zero_grad(set_to_none=True)
             pred = model(fw, fb, w)
-            loss = F.mse_loss(torch.sigmoid(pred / WDL_DIV), y)   # y is already a win-prob
+            loss = F.mse_loss(torch.sigmoid(pred / WDL_DIV), y)   # win-prob term
+            if args.lambda_cp > 0.0:
+                loss = loss + args.lambda_cp * F.mse_loss(pred, ycp)   # centipawn-space term
             loss.backward()
             opt.step()
             sched.step()
@@ -257,7 +264,7 @@ def main() -> None:
             vp = torch.empty(len(val_idx))
             for j in range(0, len(val_idx), args.batch):
                 vr = val_idx[j:j + args.batch]
-                fw, fb, w, _ = batch_tensors(vr)
+                fw, fb, w, _, _ = batch_tensors(vr)
                 vp[j:j + len(vr)] = model(fw, fb, w).cpu()
             vy = y_all[val_idx]
             mae = (vp - vy).abs().mean().item() * SCALE
