@@ -1,0 +1,17 @@
+{
+  "config": {
+    "FT": 256,
+    "L1W": 16,
+    "scale": 100.0
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 0.03786,
+      "val_mae_cp": 244.1,
+      "band_mae_cp": 78.4,
+      "band_r": 0.481,
+      "sec": 253
+    }
+  ]
+}
